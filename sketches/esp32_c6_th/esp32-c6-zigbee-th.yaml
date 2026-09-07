@@ -1,0 +1,585 @@
+external_components:
+  - source: github://Aculeasis/esphome@zigbee-reports-idle
+    components: [zigbee]
+  - source: github://Aculeasis/myesphome
+    components: [zigbee_batch]
+
+substitutions:
+  name: "esp32-c6-zigbee-th"
+  friendly_name: "ESP32-C6 Zigbee Temp & Humidity Sensor"
+
+esphome:
+  name: ${name}
+  friendly_name: ${friendly_name}
+  on_boot:
+    # Isolate the unpowered DHT22 as early as possible during startup.
+    - priority: 900
+      then:
+        - lambda: |-
+            gpio_pullup_dis(GPIO_NUM_3);
+            gpio_pulldown_dis(GPIO_NUM_3);
+
+esp32:
+  board: esp32-c6-devkitc-1
+  variant: esp32c6
+  cpu_frequency: 80MHz
+  framework:
+    type: esp-idf
+
+logger:
+  baud_rate: 0
+  level: NONE
+
+safe_mode:
+  disabled: true
+
+# --------------------------------------------------------------------------
+# Zigbee End Device Configuration (Native IEEE 802.15.4 Radio)
+# --------------------------------------------------------------------------
+zigbee:
+  id: zb_stack
+  router: false
+  power_source: BATTERY
+  model: "ptvo.switch"
+  on_join:
+    then:
+      - lambda: 'id(is_joined) = true;'
+      # Only factory-new devices need time for coordinator discovery,
+      # interview, reporting configuration, and bindings.
+      - if:
+          condition:
+            lambda: 'return x;'
+          then:
+            - lambda: 'id(sleep_allowed) = false;'
+            - script.execute: blink_joined
+            - delay: 35s
+            - lambda: 'id(sleep_allowed) = true;'
+          else:
+            # A known device can resume immediately after startup or rejoin.
+            - lambda: 'id(sleep_allowed) = true;'
+      - script.execute: awake_safety_guard
+      # Do not create a second owner of the measurement/sleep state machine
+      # when a rejoin notification occurs during an active cycle.
+      - if:
+          condition:
+            not:
+              script.is_running: measurement_cycle
+          then:
+            - script.execute: measurement_cycle
+
+zigbee_batch:
+  id: zb_batch
+  zigbee_id: zb_stack
+
+  endpoint: 1
+  destination_endpoint: 1
+
+  cluster_id: 0xFC01
+  command_id: 0x00
+
+# --------------------------------------------------------------------------
+# Global Variables
+# --------------------------------------------------------------------------
+globals:
+  # Set only by on_join in the current boot. It is intentionally not restored.
+  - id: is_joined
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+  # Allows application-managed light sleep after the post-join awake window.
+  - id: sleep_allowed
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+  # Main sleep result: 0=timer/other wakeup, 1=button, -1=sleep error.
+  - id: wakeup_reason
+    type: int
+    restore_value: no
+    initial_value: '0'
+  # A short button wake requests one measurement including battery and uptime.
+  - id: button_measurement_request
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+
+  # Monotonic timestamp captured immediately after each regular timer wakeup.
+  # The first cycle initializes it before measuring. Button-triggered wakeups
+  # leave it unchanged so they do not shift the regular 10-minute schedule.
+  - id: regular_cycle_started_us
+    type: int64_t
+    restore_value: no
+    initial_value: '0'
+
+  # Actual time spent by the previous measurement cycle waiting for
+  # zb_batch.is_idle(). This value is inserted into the next packet.
+  - id: zb_last_wait_ms
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+
+  # First packet after boot must not claim that previous latency=0ms.
+  - id: zb_last_wait_valid
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+
+  # Start timestamp used only while waiting for the current batch TX.
+  - id: zb_wait_started_us
+    type: int64_t
+    restore_value: no
+    initial_value: '0'
+
+  # Result of the current send() queue operation.
+  - id: zb_send_queued
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+
+
+# --------------------------------------------------------------------------
+# Sleep Component Declaration (also makes ESP-IDF sleep APIs available)
+# --------------------------------------------------------------------------
+deep_sleep:
+  id: deep_sleep_mgr
+
+# --------------------------------------------------------------------------
+# Internal emergency restart button (safety fallback only)
+# --------------------------------------------------------------------------
+button:
+  - platform: restart
+    id: emergency_restart
+    name: None
+    internal: true
+
+# --------------------------------------------------------------------------
+# Internal Switches (Status LED, DHT22 Switched Power, Voltage Divider GND Key)
+# --------------------------------------------------------------------------
+switch:
+  # Onboard blue LED (GPIO15, internal to hide from Zigbee exposes)
+  - platform: gpio
+    pin:
+      number: GPIO15
+      ignore_strapping_warning: true
+    id: status_led
+    internal: true
+    restore_mode: ALWAYS_OFF
+
+  # Switched power supply for DHT22 (GPIO2)
+  - platform: gpio
+    pin: GPIO2
+    id: dht_power_switch
+    internal: true
+    restore_mode: ALWAYS_OFF
+
+  # Switched ground key for battery voltage divider (GPIO19)
+  - platform: gpio
+    pin:
+      number: GPIO19
+      mode:
+        output: true
+        open_drain: true
+      inverted: true
+    id: vbat_gnd_switch
+    internal: true
+    restore_mode: ALWAYS_OFF
+
+# --------------------------------------------------------------------------
+# Button (GPIO9 / BOOT -> GND)
+#
+# While joined, only the GPIO wake path handles the button. The binary sensor is
+# used while unjoined solely to detect an 8-second factory-reset hold.
+# --------------------------------------------------------------------------
+binary_sensor:
+  - platform: gpio
+    pin:
+      number: GPIO9
+      mode:
+        input: true
+        pullup: true
+      inverted: true
+      ignore_strapping_warning: true
+    id: action_button
+    internal: true
+    filters:
+      - delayed_on: 20ms
+      - delayed_off: 20ms
+    on_press:
+      then:
+        - if:
+            condition:
+              lambda: 'return !id(is_joined);'
+            then:
+              - script.execute: hold_timer_script
+    on_release:
+      then:
+        - if:
+            condition:
+              lambda: 'return !id(is_joined);'
+            then:
+              - script.stop: hold_timer_script
+
+# --------------------------------------------------------------------------
+# Scripts for LED Indications and Measurement Sequence
+# --------------------------------------------------------------------------
+script:
+  # 8-Second Hold Timer: Used only while the device is not joined.
+  - id: hold_timer_script
+    mode: restart
+    then:
+      - delay: 8s
+      - lambda: |-
+          id(is_joined) = false;
+          id(sleep_allowed) = false;
+      - script.stop: measurement_cycle
+      - script.execute: blink_pairing
+      - zigbee.factory_reset
+
+  # Pairing indicator: 5 fast blinks (100ms on / 100ms off)
+  - id: blink_pairing
+    then:
+      - repeat:
+          count: 5
+          then:
+            - switch.turn_on: status_led
+            - delay: 100ms
+            - switch.turn_off: status_led
+            - delay: 100ms
+
+  # Network joined indicator: 1 long blink (1000ms)
+  - id: blink_joined
+    then:
+      - switch.turn_on: status_led
+      - delay: 1000ms
+      - switch.turn_off: status_led
+
+  # Emergency guard for the active measurement state machine. Normal light
+  # sleep stops this timer; a stalled active cycle restarts the MCU after 120s.
+  - id: awake_safety_guard
+    mode: restart
+    then:
+      - delay: 120s
+      - button.press: emergency_restart
+
+  # Enter the main 10-minute light sleep and classify its result. A sleep
+  # rejected because GPIO9 is already LOW is handled as a button wake; any
+  # other failure requests an immediate restart.
+  - id: sleep_cycle
+    mode: single
+    then:
+      - if:
+          condition:
+            lambda: 'return id(is_joined) && id(sleep_allowed);'
+          then:
+            - script.stop: awake_safety_guard
+            - lambda: |-
+                id(wakeup_reason) = 0;
+                constexpr int64_t period_us = 600LL * 1000000LL;
+                const int64_t elapsed_us =
+                    esp_timer_get_time() - id(regular_cycle_started_us);
+                const int64_t remaining_us = period_us - elapsed_us;
+                const uint64_t uncorrected_sleep_us =
+                    remaining_us > 0
+                        ? static_cast<uint64_t>(remaining_us)
+                        : static_cast<uint64_t>(period_us);
+
+                // The internal RTC slow clock on this board wakes about
+                // 0.4697484% early. 16 observed 10-minute intervals averaged
+                // 597.194687s, so scale only the actual light-sleep duration
+                // by 600 / 597.194687 = 1.004697484. Fixed-point arithmetic
+                // avoids floating point and rounds to the nearest microsecond.
+                constexpr uint64_t sleep_scale_num = 1004697484ULL;
+                constexpr uint64_t sleep_scale_den = 1000000000ULL;
+                const uint64_t sleep_us =
+                    (uncorrected_sleep_us * sleep_scale_num +
+                     sleep_scale_den / 2) /
+                    sleep_scale_den;
+
+                esp_sleep_enable_timer_wakeup(sleep_us);
+                // GPIO9 is active LOW and can interrupt the wait.
+                gpio_wakeup_enable(GPIO_NUM_9, GPIO_INTR_LOW_LEVEL);
+                esp_sleep_enable_gpio_wakeup();
+
+                esp_err_t sleep_result = esp_light_sleep_start();
+                const int64_t wakeup_us = esp_timer_get_time();
+
+                // Always disarm both wake sources after returning from sleep.
+                gpio_wakeup_disable(GPIO_NUM_9);
+                esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_GPIO);
+                esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_TIMER);
+
+                if (sleep_result == ESP_OK) {
+                  esp_sleep_wakeup_cause_t cause = esp_sleep_get_wakeup_cause();
+                  id(wakeup_reason) = (cause == ESP_SLEEP_WAKEUP_GPIO) ? 1 : 0;
+                  if (cause == ESP_SLEEP_WAKEUP_TIMER) {
+                    id(regular_cycle_started_us) = wakeup_us;
+                  }
+                } else if (sleep_result == ESP_ERR_SLEEP_REJECT &&
+                           gpio_get_level(GPIO_NUM_9) == 0) {
+                  // Treat an already-active wake pin as a button wakeup.
+                  id(wakeup_reason) = 1;
+                } else {
+                  id(wakeup_reason) = -1;
+                }
+            - if:
+                condition:
+                  lambda: 'return id(wakeup_reason) < 0;'
+                then:
+                  - button.press: emergency_restart
+
+  # Classify a GPIO wake by pin level instead of relying on binary_sensor edge
+  # delivery after light sleep has returned.
+  - id: handle_button_wakeup
+    mode: single
+    then:
+      # Let the button settle after the GPIO wake event.
+      - delay: 30ms
+      # A released button satisfies this immediately. A held button waits for
+      # release, but no longer than the factory-reset threshold.
+      - wait_until:
+          condition:
+            lambda: 'return gpio_get_level(GPIO_NUM_9) == 1;'
+          timeout: 8s
+      - if:
+          condition:
+            lambda: 'return gpio_get_level(GPIO_NUM_9) == 0;'
+          then:
+            # Still LOW after 8s: this is a deliberate long press.
+            - lambda: |-
+                id(is_joined) = false;
+                id(sleep_allowed) = false;
+                id(button_measurement_request) = false;
+            - script.stop: awake_safety_guard
+            - script.execute: blink_pairing
+            - zigbee.factory_reset
+          else:
+            # Released before 8s: exactly one forced measurement.
+            - lambda: 'id(button_measurement_request) = true;'
+
+  # Single, iterative owner of all regular measurement and sleep transitions.
+  - id: measurement_cycle
+    mode: restart
+    then:
+      - while:
+          condition:
+            lambda: 'return id(is_joined) && id(sleep_allowed);'
+          then:
+            - script.execute: awake_safety_guard
+
+            - if:
+                condition:
+                  lambda: 'return id(button_measurement_request);'
+                then:
+                  - lambda: |-
+                      id(button_measurement_request) = false;
+
+                  - script.execute: perform_measurement
+                  - script.wait: perform_measurement
+
+                else:
+                  - lambda: |-
+                      if (id(regular_cycle_started_us) == 0) {
+                        id(regular_cycle_started_us) = esp_timer_get_time();
+                      }
+
+                  - script.execute: perform_measurement
+                  - script.wait: perform_measurement
+
+            - script.execute: sleep_cycle
+            - script.wait: sleep_cycle
+
+            - if:
+                condition:
+                  lambda: 'return id(is_joined) && id(wakeup_reason) == 1;'
+                then:
+                  - script.execute: handle_button_wakeup
+                  - script.wait: handle_button_wakeup
+
+  # Main measurement and transmission sequence
+  - id: perform_measurement
+    mode: single
+    then:
+      - lambda: |-
+          gpio_pullup_en(GPIO_NUM_3);
+      - switch.turn_on: dht_power_switch
+      - switch.turn_on: vbat_gnd_switch
+
+      - lambda: |-
+          gpio_hold_en(GPIO_NUM_2);
+          gpio_hold_en(GPIO_NUM_19);
+
+          esp_sleep_enable_timer_wakeup(2000000ULL);
+          esp_light_sleep_start();
+          esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_TIMER);
+
+          gpio_hold_dis(GPIO_NUM_2);
+          gpio_hold_dis(GPIO_NUM_19);
+
+      - component.update: dht_sensor
+      - component.update: battery_voltage
+      - component.update: uptime_sensor
+      - switch.turn_off: dht_power_switch
+      - switch.turn_off: vbat_gnd_switch
+
+      - lambda: |-
+          // Prevent parasite powering of DHT22 while sleeping.
+          gpio_pullup_dis(GPIO_NUM_3);
+          gpio_pulldown_dis(GPIO_NUM_3);
+
+      # 5. Send ONE custom Zigbee command.
+      # The previous wait latency is placed into this packet.
+      - switch.turn_on: status_led
+      - lambda: |-
+          id(zb_send_queued) =
+              id(zb_batch).send(
+                  id(temperature).state,
+                  id(humidity).state,
+                  id(battery_voltage).state,
+                  id(battery_level).state,
+                  id(uptime_sensor).state,
+                  id(zb_last_wait_ms),
+                  id(zb_last_wait_valid));
+
+          if (id(zb_send_queued)) {
+            // Start after send() has queued the packet. This measures the
+            // actual time spent waiting on is_idle().
+            id(zb_wait_started_us) = esp_timer_get_time();
+          }
+
+      # 6. Wait for TX completion.
+      - if:
+          condition:
+            lambda: 'return id(zb_send_queued);'
+          then:
+            - wait_until:
+                condition:
+                  lambda: 'return id(zb_batch).is_idle();'
+                timeout: 5s
+
+            # Save current wait latency for the next packet.
+            - lambda: |-
+                const int64_t elapsed_us =
+                    esp_timer_get_time() - id(zb_wait_started_us);
+
+                uint32_t elapsed_ms = static_cast<uint32_t>(
+                    (elapsed_us + 999LL) / 1000LL);
+
+                if (elapsed_ms > 65535U) {
+                  elapsed_ms = 65535U;
+                }
+
+                id(zb_last_wait_ms) = elapsed_ms;
+                id(zb_last_wait_valid) = true;
+
+                ESP_LOGD(
+                    "zigbee_batch",
+                    "wait_until latency=%ums, confirm latency=%ums, "
+                    "TX status=0x%02X",
+                    static_cast<unsigned>(id(zb_last_wait_ms)),
+                    static_cast<unsigned>(
+                        id(zb_batch).last_confirm_latency_ms()),
+                    static_cast<unsigned>(id(zb_batch).last_tx_status()));
+
+            # Do not enter light sleep with a command still outstanding.
+            - if:
+                condition:
+                  lambda: 'return !id(zb_batch).is_idle();'
+                then:
+                  - lambda: |-
+                      ESP_LOGE(
+                          "zigbee_batch",
+                          "TX still pending after 5s; restarting instead of sleeping");
+                  - button.press: emergency_restart
+
+          else:
+            # send() failed before the command was queued. Preserve the last
+            # real wait latency for the next attempt.
+            - lambda: |-
+                ESP_LOGW(
+                    "zigbee_batch",
+                    "Batch packet was not queued; preserving previous wait latency");
+
+      - switch.turn_off: status_led
+
+      # 5. measurement_cycle exclusively owns the transition to main sleep.
+
+# --------------------------------------------------------------------------
+# Sensors (Mapped to Zigbee Clusters)
+# --------------------------------------------------------------------------
+sensor:
+  - platform: dht
+    pin:
+      number: GPIO3
+      mode:
+        input: true
+        pullup: false
+    model: DHT22
+    temperature:
+      name: "Temperature"
+      id: temperature
+      internal: true
+      filters:
+        - filter_out: nan
+        - round: 1
+    humidity:
+      name: "Humidity"
+      id: humidity
+      internal: true
+      filters:
+        - filter_out: nan
+        - round: 1
+    update_interval: never
+    id: dht_sensor
+  - platform: adc
+    pin: GPIO0
+    id: battery_voltage
+    name: "Battery Voltage"
+    internal: true
+    entity_category: "diagnostic"
+    unit_of_measurement: "V"
+    device_class: "voltage"
+    state_class: "measurement"
+    accuracy_decimals: 2
+    attenuation: 6db
+    update_interval: never
+    filters:
+      # Calibrated multiplier: 3.22848 * (4.14 / 4.1) = 3.25998
+      - multiply: 3.25998
+      - round: 2
+  - platform: copy
+    source_id: battery_voltage
+    id: battery_level
+    name: "Battery Level"
+    internal: true
+    entity_category: "diagnostic"
+    unit_of_measurement: "%"
+    device_class: "battery"
+    state_class: "measurement"
+    accuracy_decimals: 0
+    filters:
+      # Li-Ion 18650 1S discharge curve calibration
+      - calibrate_linear:
+          method: exact
+          datapoints:
+            - 3.10 -> 0.0
+            - 3.50 -> 10.0
+            - 3.65 -> 25.0
+            - 3.75 -> 50.0
+            - 3.85 -> 75.0
+            - 4.00 -> 90.0
+            - 4.15 -> 100.0
+      - clamp:
+          min_value: 0.0
+          max_value: 100.0
+      - round: 0
+  - platform: uptime
+    id: uptime_sensor
+    name: "Uptime"
+    internal: true
+    entity_category: "diagnostic"
+    unit_of_measurement: "s"
+    device_class: "duration"
+    state_class: "total_increasing"
+    accuracy_decimals: 0
+    update_interval: never
+    filters:
+      - round: 0

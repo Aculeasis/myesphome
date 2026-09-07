@@ -58,7 +58,7 @@ function decodeBatch(model, msg) {
     if (flags & (1 << 2)) result.battery_voltage = data.readUInt16LE(6) / 1000.0;
     if (flags & (1 << 3)) result.battery = data.readUInt8(8);
     if (flags & (1 << 4)) result.uptime = data.readUInt32LE(9);
-    if (flags & (1 << 5)) result.previous_tx_wait_ms = data.readUInt16LE(13);
+    if (flags & (1 << 5)) result.previous_tx_wait = data.readUInt16LE(13);
 
     return Object.keys(result).length > 0 ? result : undefined;
 }
@@ -93,7 +93,7 @@ const definition = {
             .withUnit('s')
             .withDescription('Device uptime in seconds')
             .withCategory('diagnostic'),
-        e.numeric('previous_tx_wait_ms', ea.STATE)
+        e.numeric('previous_tx_wait', ea.STATE)
             .withUnit('ms')
             .withDescription('Previous batch transmission wait time')
             .withCategory('diagnostic'),
