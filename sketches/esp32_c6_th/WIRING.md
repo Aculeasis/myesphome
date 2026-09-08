@@ -21,6 +21,8 @@
 
 ## Схема
 
+![Схема подключения ESP32-C6 Zigbee TH](wiring.png)
+
 ```text
 Li-ion + / B+
      |
