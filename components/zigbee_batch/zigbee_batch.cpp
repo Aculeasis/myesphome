@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <limits>
 
+#include "esphome/core/application.h"
 #include "esphome/core/log.h"
 
 #include "esp_timer.h"
@@ -242,6 +243,7 @@ void ZigbeeBatchComponent::tx_confirm_(ezb_zcl_cmd_cnf_t *cnf,
   // Release last. is_idle() uses acquire semantics, so observing idle=true
   // also observes the status and latency written above.
   self->tx_pending_.store(0, std::memory_order_release);
+  App.wake_loop_threadsafe();
 }
 
 

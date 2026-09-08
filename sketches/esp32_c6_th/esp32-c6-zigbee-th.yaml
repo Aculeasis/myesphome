@@ -401,18 +401,115 @@ script:
                 then:
                   - lambda: |-
                       id(button_measurement_request) = false;
-
-                  - script.execute: perform_measurement
-                  - script.wait: perform_measurement
-
                 else:
                   - lambda: |-
                       if (id(regular_cycle_started_us) == 0) {
                         id(regular_cycle_started_us) = esp_timer_get_time();
                       }
 
-                  - script.execute: perform_measurement
-                  - script.wait: perform_measurement
+            # Measure and send inline so TX completion continues straight to sleep.
+            - lambda: |-
+                gpio_pullup_en(GPIO_NUM_3);
+            - switch.turn_on: dht_power_switch
+            - switch.turn_on: vbat_gnd_switch
+
+            # Keep sensor power enabled while the MCU sleeps during warmup.
+            - lambda: |-
+                gpio_hold_en(GPIO_NUM_2);
+                gpio_hold_en(GPIO_NUM_19);
+
+                esp_sleep_enable_timer_wakeup(2000000ULL);
+                esp_light_sleep_start();
+                esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_TIMER);
+
+                gpio_hold_dis(GPIO_NUM_2);
+                gpio_hold_dis(GPIO_NUM_19);
+
+            - component.update: dht_sensor
+            - component.update: battery_voltage
+            - component.update: uptime_sensor
+            - switch.turn_off: dht_power_switch
+            - switch.turn_off: vbat_gnd_switch
+
+            - lambda: |-
+                // Prevent parasite powering of DHT22 while sleeping.
+                gpio_pullup_dis(GPIO_NUM_3);
+                gpio_pulldown_dis(GPIO_NUM_3);
+
+            # Send ONE custom Zigbee command.
+            # The previous wait latency is placed into this packet.
+            - switch.turn_on: status_led
+            - lambda: |-
+                id(zb_send_queued) =
+                    id(zb_batch).send(
+                        id(temperature).state,
+                        id(humidity).state,
+                        id(battery_voltage).state,
+                        id(battery_level).state,
+                        id(uptime_sensor).state,
+                        id(zb_last_wait_ms),
+                        id(zb_last_wait_valid));
+
+                if (id(zb_send_queued)) {
+                  // Start after send() has queued the packet. This measures the
+                  // actual time spent waiting on is_idle().
+                  id(zb_wait_started_us) = esp_timer_get_time();
+                }
+
+            # Wait for TX completion in this same action chain.
+            - if:
+                condition:
+                  lambda: 'return id(zb_send_queued);'
+                then:
+                  - wait_until:
+                      condition:
+                        lambda: 'return id(zb_batch).is_idle();'
+                      timeout: 5s
+
+                  # Save current wait latency for the next packet.
+                  - lambda: |-
+                      const int64_t elapsed_us =
+                          esp_timer_get_time() - id(zb_wait_started_us);
+
+                      uint32_t elapsed_ms = static_cast<uint32_t>(
+                          (elapsed_us + 999LL) / 1000LL);
+
+                      if (elapsed_ms > 65535U) {
+                        elapsed_ms = 65535U;
+                      }
+
+                      id(zb_last_wait_ms) = elapsed_ms;
+                      id(zb_last_wait_valid) = true;
+
+                      ESP_LOGD(
+                          "zigbee_batch",
+                          "wait_until latency=%ums, confirm latency=%ums, "
+                          "TX status=0x%02X",
+                          static_cast<unsigned>(id(zb_last_wait_ms)),
+                          static_cast<unsigned>(
+                              id(zb_batch).last_confirm_latency_ms()),
+                          static_cast<unsigned>(id(zb_batch).last_tx_status()));
+
+                  # Do not enter light sleep with a command still outstanding.
+                  - if:
+                      condition:
+                        lambda: 'return !id(zb_batch).is_idle();'
+                      then:
+                        - lambda: |-
+                            ESP_LOGE(
+                                "zigbee_batch",
+                                "TX still pending after 5s; restarting instead of sleeping");
+                        - button.press: emergency_restart
+
+                else:
+                  # send() failed before the command was queued. Preserve the last
+                  # real wait latency for the next attempt.
+                  - lambda: |-
+                      ESP_LOGW(
+                          "zigbee_batch",
+                          "Batch packet was not queued; preserving previous wait latency");
+
+            - switch.turn_off: status_led
 
             - script.execute: sleep_cycle
             - script.wait: sleep_cycle
@@ -423,115 +520,6 @@ script:
                 then:
                   - script.execute: handle_button_wakeup
                   - script.wait: handle_button_wakeup
-
-  # Main measurement and transmission sequence
-  - id: perform_measurement
-    mode: single
-    then:
-      - lambda: |-
-          gpio_pullup_en(GPIO_NUM_3);
-      - switch.turn_on: dht_power_switch
-      - switch.turn_on: vbat_gnd_switch
-
-      # Keep sensor power enabled while the MCU sleeps during warmup.
-      - lambda: |-
-          gpio_hold_en(GPIO_NUM_2);
-          gpio_hold_en(GPIO_NUM_19);
-
-          esp_sleep_enable_timer_wakeup(2000000ULL);
-          esp_light_sleep_start();
-          esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_TIMER);
-
-          gpio_hold_dis(GPIO_NUM_2);
-          gpio_hold_dis(GPIO_NUM_19);
-
-      - component.update: dht_sensor
-      - component.update: battery_voltage
-      - component.update: uptime_sensor
-      - switch.turn_off: dht_power_switch
-      - switch.turn_off: vbat_gnd_switch
-
-      - lambda: |-
-          // Prevent parasite powering of DHT22 while sleeping.
-          gpio_pullup_dis(GPIO_NUM_3);
-          gpio_pulldown_dis(GPIO_NUM_3);
-
-      # 5. Send ONE custom Zigbee command.
-      # The previous wait latency is placed into this packet.
-      - switch.turn_on: status_led
-      - lambda: |-
-          id(zb_send_queued) =
-              id(zb_batch).send(
-                  id(temperature).state,
-                  id(humidity).state,
-                  id(battery_voltage).state,
-                  id(battery_level).state,
-                  id(uptime_sensor).state,
-                  id(zb_last_wait_ms),
-                  id(zb_last_wait_valid));
-
-          if (id(zb_send_queued)) {
-            // Start after send() has queued the packet. This measures the
-            // actual time spent waiting on is_idle().
-            id(zb_wait_started_us) = esp_timer_get_time();
-          }
-
-      # 6. Wait for TX completion.
-      - if:
-          condition:
-            lambda: 'return id(zb_send_queued);'
-          then:
-            - wait_until:
-                condition:
-                  lambda: 'return id(zb_batch).is_idle();'
-                timeout: 5s
-
-            # Save current wait latency for the next packet.
-            - lambda: |-
-                const int64_t elapsed_us =
-                    esp_timer_get_time() - id(zb_wait_started_us);
-
-                uint32_t elapsed_ms = static_cast<uint32_t>(
-                    (elapsed_us + 999LL) / 1000LL);
-
-                if (elapsed_ms > 65535U) {
-                  elapsed_ms = 65535U;
-                }
-
-                id(zb_last_wait_ms) = elapsed_ms;
-                id(zb_last_wait_valid) = true;
-
-                ESP_LOGD(
-                    "zigbee_batch",
-                    "wait_until latency=%ums, confirm latency=%ums, "
-                    "TX status=0x%02X",
-                    static_cast<unsigned>(id(zb_last_wait_ms)),
-                    static_cast<unsigned>(
-                        id(zb_batch).last_confirm_latency_ms()),
-                    static_cast<unsigned>(id(zb_batch).last_tx_status()));
-
-            # Do not enter light sleep with a command still outstanding.
-            - if:
-                condition:
-                  lambda: 'return !id(zb_batch).is_idle();'
-                then:
-                  - lambda: |-
-                      ESP_LOGE(
-                          "zigbee_batch",
-                          "TX still pending after 5s; restarting instead of sleeping");
-                  - button.press: emergency_restart
-
-          else:
-            # send() failed before the command was queued. Preserve the last
-            # real wait latency for the next attempt.
-            - lambda: |-
-                ESP_LOGW(
-                    "zigbee_batch",
-                    "Batch packet was not queued; preserving previous wait latency");
-
-      - switch.turn_off: status_led
-
-      # 5. measurement_cycle exclusively owns the transition to main sleep.
 
 # --------------------------------------------------------------------------
 # Sensors (Mapped to Zigbee Clusters)
