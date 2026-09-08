@@ -41,29 +41,31 @@ zigbee:
   model: "ptvo.switch"
   on_join:
     then:
-      - lambda: 'id(is_joined) = true;'
-      # Only factory-new devices need time for coordinator discovery,
-      # interview, reporting configuration, and bindings.
+      # Cancel a hold started before joining; it must not reset the device
+      # during the coordinator interview.
+      - script.stop: hold_timer_script
+      - lambda: |-
+          id(is_joined) = true;
+          id(sleep_allowed) = false;
+      - script.stop: awake_safety_guard
+      # Reserve an interview window only for a factory-new device.
       - if:
           condition:
             lambda: 'return x;'
           then:
-            - lambda: 'id(sleep_allowed) = false;'
             - script.execute: blink_joined
-            - delay: 35s
-            - lambda: 'id(sleep_allowed) = true;'
+            - script.execute: finish_join
           else:
-            # A known device can resume immediately after startup or rejoin.
+            # Resume immediately with saved credentials, including rejoin.
+            - script.stop: finish_join
             - lambda: 'id(sleep_allowed) = true;'
-      - script.execute: awake_safety_guard
-      # Do not create a second owner of the measurement/sleep state machine
-      # when a rejoin notification occurs during an active cycle.
-      - if:
-          condition:
-            not:
-              script.is_running: measurement_cycle
-          then:
-            - script.execute: measurement_cycle
+            - script.execute: awake_safety_guard
+            - if:
+                condition:
+                  not:
+                    script.is_running: measurement_cycle
+                then:
+                  - script.execute: measurement_cycle
 
 zigbee_batch:
   id: zb_batch
@@ -198,6 +200,10 @@ binary_sensor:
       ignore_strapping_warning: true
     id: action_button
     internal: true
+    # Light-sleep wakeup sets GPIO9 to LOW-level interrupt mode. Poll the
+    # button to avoid repeated CPU interrupts while it remains pressed.
+    # Hardware GPIO wakeup is configured separately in sleep_cycle.
+    use_interrupt: false
     filters:
       - delayed_on: 20ms
       - delayed_off: 20ms
@@ -210,26 +216,57 @@ binary_sensor:
               - script.execute: hold_timer_script
     on_release:
       then:
-        - if:
-            condition:
-              lambda: 'return !id(is_joined);'
-            then:
-              - script.stop: hold_timer_script
+        - script.stop: hold_timer_script
 
 # --------------------------------------------------------------------------
 # Scripts for LED Indications and Measurement Sequence
 # --------------------------------------------------------------------------
 script:
+  # For a factory-new join, keep the radio available while the button is held
+  # and for 30 seconds after release so the coordinator can interview it.
+  - id: finish_join
+    mode: restart
+    then:
+      - wait_until:
+          condition:
+            lambda: 'return gpio_get_level(GPIO_NUM_9) == 1;'
+      - delay: 30s
+      - lambda: 'id(sleep_allowed) = true;'
+      - if:
+          condition:
+            not:
+              script.is_running: measurement_cycle
+          then:
+            - script.execute: measurement_cycle
+
   # 8-Second Hold Timer: Used only while the device is not joined.
   - id: hold_timer_script
     mode: restart
     then:
       - delay: 8s
+      - if:
+          condition:
+            lambda: 'return !id(is_joined) && gpio_get_level(GPIO_NUM_9) == 0;'
+          then:
+            - script.execute: reset_after_release
+
+  # Perform the reboot only after BOOT is released, and only once per hold.
+  - id: reset_after_release
+    mode: single
+    then:
       - lambda: |-
           id(is_joined) = false;
           id(sleep_allowed) = false;
+          id(button_measurement_request) = false;
+      - script.stop: finish_join
+      - script.stop: awake_safety_guard
       - script.stop: measurement_cycle
       - script.execute: blink_pairing
+      - wait_until:
+          condition:
+            lambda: 'return gpio_get_level(GPIO_NUM_9) == 1;'
+      - delay: 30ms
+      - script.wait: blink_pairing
       - zigbee.factory_reset
 
   # Pairing indicator: 5 fast blinks (100ms on / 100ms off)
@@ -342,14 +379,8 @@ script:
           condition:
             lambda: 'return gpio_get_level(GPIO_NUM_9) == 0;'
           then:
-            # Still LOW after 8s: this is a deliberate long press.
-            - lambda: |-
-                id(is_joined) = false;
-                id(sleep_allowed) = false;
-                id(button_measurement_request) = false;
-            - script.stop: awake_safety_guard
-            - script.execute: blink_pairing
-            - zigbee.factory_reset
+            # Still LOW after 8s: arm reset, then wait for release.
+            - script.execute: reset_after_release
           else:
             # Released before 8s: exactly one forced measurement.
             - lambda: 'id(button_measurement_request) = true;'
@@ -388,7 +419,7 @@ script:
 
             - if:
                 condition:
-                  lambda: 'return id(is_joined) && id(wakeup_reason) == 1;'
+                  lambda: 'return id(is_joined) && id(sleep_allowed) && id(wakeup_reason) == 1;'
                 then:
                   - script.execute: handle_button_wakeup
                   - script.wait: handle_button_wakeup
@@ -402,6 +433,7 @@ script:
       - switch.turn_on: dht_power_switch
       - switch.turn_on: vbat_gnd_switch
 
+      # Keep sensor power enabled while the MCU sleeps during warmup.
       - lambda: |-
           gpio_hold_en(GPIO_NUM_2);
           gpio_hold_en(GPIO_NUM_19);
