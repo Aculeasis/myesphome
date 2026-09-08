@@ -1,6 +1,4 @@
 external_components:
-  - source: github://Aculeasis/esphome@zigbee-reports-idle
-    components: [zigbee]
   - source: github://Aculeasis/myesphome
     components: [zigbee_batch]
 
@@ -282,12 +280,13 @@ script:
                         ? static_cast<uint64_t>(remaining_us)
                         : static_cast<uint64_t>(period_us);
 
-                // The internal RTC slow clock on this board wakes about
-                // 0.4697484% early. 16 observed 10-minute intervals averaged
-                // 597.194687s, so scale only the actual light-sleep duration
-                // by 600 / 597.194687 = 1.004697484. Fixed-point arithmetic
-                // avoids floating point and rounds to the nearest microsecond.
-                constexpr uint64_t sleep_scale_num = 1004697484ULL;
+                // Recalibrated from 65 consecutive observations (64 intervals).
+                // With the previous factor, linear regression measured a
+                // 600.974226s period. Apply 600 / 600.974226 to that factor,
+                // giving 1.003068792 for the actual light-sleep duration.
+                // Fixed-point arithmetic avoids floating point and rounds to
+                // the nearest microsecond.
+                constexpr uint64_t sleep_scale_num = 1003068792ULL;
                 constexpr uint64_t sleep_scale_den = 1000000000ULL;
                 const uint64_t sleep_us =
                     (uncorrected_sleep_us * sleep_scale_num +
@@ -518,14 +517,12 @@ sensor:
       id: temperature
       internal: true
       filters:
-        - filter_out: nan
         - round: 1
     humidity:
       name: "Humidity"
       id: humidity
       internal: true
       filters:
-        - filter_out: nan
         - round: 1
     update_interval: never
     id: dht_sensor

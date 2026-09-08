@@ -2,7 +2,9 @@ import esphome.codegen as cg
 import esphome.config_validation as cv
 
 from esphome.const import CONF_ID
-from esphome.components.zigbee.const import ZigbeeComponent
+from esphome.components.zigbee.const import KEY_ZIGBEE, ZigbeeComponent
+from esphome.components.zigbee.const_esp32 import KEY_ZIGBEE_EP
+from esphome.core import CORE
 
 
 DEPENDENCIES = ["zigbee"]
@@ -49,6 +51,16 @@ CONFIG_SCHEMA = cv.All(
 
 
 async def to_code(config):
+    # All final validators have run by code generation, including Zigbee's
+    # endpoint allocation. Checking earlier can miss automatically assigned IDs.
+    endpoints = CORE.data.get(KEY_ZIGBEE, {}).get(KEY_ZIGBEE_EP, {})
+    if config[CONF_ENDPOINT] not in endpoints:
+        raise cv.Invalid(
+            f"zigbee_batch endpoint {config[CONF_ENDPOINT]} does not exist. "
+            "Select an endpoint declared in the Zigbee configuration "
+            f"(available: {sorted(endpoints)})."
+        )
+
     var = cg.new_Pvariable(config[CONF_ID])
     await cg.register_component(var, config)
 
@@ -64,8 +76,8 @@ async def to_code(config):
     cg.add(var.set_cluster_id(config[CONF_CLUSTER_ID]))
     cg.add(var.set_command_id(config[CONF_COMMAND_ID]))
 
-    # Endpoint 1 is created by the Zigbee component before runtime setup
-    # registers the device descriptor with the stack.
+    # The selected endpoint is created by the Zigbee component before runtime
+    # setup registers the device descriptor with the stack.
     cg.add(
         zb.add_cluster(
             config[CONF_ENDPOINT],
