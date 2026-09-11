@@ -25,6 +25,14 @@ ZigbeeBatchComponent = zigbee_batch_ns.class_(
 )
 
 
+def _validate_cluster_ids(config):
+    if config[CONF_CLUSTER_ID] == config[CONF_DIAGNOSTIC_CLUSTER_ID]:
+        raise cv.Invalid(
+            "zigbee_batch data and diagnostic cluster IDs must differ"
+        )
+    return config
+
+
 CONFIG_SCHEMA = cv.All(
     cv.Schema(
         {
@@ -51,6 +59,7 @@ CONFIG_SCHEMA = cv.All(
         }
     ).extend(cv.COMPONENT_SCHEMA),
     cv.only_on_esp32,
+    _validate_cluster_ids,
 )
 
 
@@ -63,11 +72,6 @@ async def to_code(config):
             f"zigbee_batch endpoint {config[CONF_ENDPOINT]} does not exist. "
             "Select an endpoint declared in the Zigbee configuration "
             f"(available: {sorted(endpoints)})."
-        )
-
-    if config[CONF_CLUSTER_ID] == config[CONF_DIAGNOSTIC_CLUSTER_ID]:
-        raise cv.Invalid(
-            "zigbee_batch data and diagnostic cluster IDs must differ"
         )
 
     var = cg.new_Pvariable(config[CONF_ID])

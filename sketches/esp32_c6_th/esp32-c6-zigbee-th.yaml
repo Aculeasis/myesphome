@@ -513,6 +513,8 @@ script:
                         - button.press: emergency_restart
                       else:
                         - lambda: 'id(zb_batch).finish_tx();'
+                else:
+                  - lambda: 'id(zb_last_wait_valid) = false;'
 
             - switch.turn_off: status_led
 
