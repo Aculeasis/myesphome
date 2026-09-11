@@ -78,11 +78,16 @@ GPIO9 -------------------------- кнопка ---------------- GND
 | :--- | :--- |
 | Source endpoint | `1` |
 | Destination | coordinator `0x0000`, endpoint `1` |
-| Server cluster | `0xFC01` |
+| Data server cluster | `0xFC01` |
+| Diagnostic server cluster | `0xFC02` |
 | Command | `0x00` |
 | Payload | `15` байт, version `1` |
 | Default Response | отключён |
 
-Пакет содержит temperature, humidity, battery voltage, battery %, uptime и время ожидания TX предыдущего пакета. У первого пакета после загрузки previous latency помечена как невалидная. Значение хранится только в RAM, что соответствует используемому Light Sleep.
+Основной пакет содержит temperature, humidity, battery voltage, battery %, uptime и время ожидания TX предыдущего пакета. У первого пакета после загрузки previous latency помечена как невалидная. Значение хранится только в RAM, что соответствует используемому Light Sleep.
+
+Первая ошибка сохраняется во flash и не затирается последующими ошибками. Для каждого нового сохранённого события увеличивается постоянный 32-битный счётчик. После следующей успешной основной передачи прошивка один раз отправляет отдельную семибайтовую диагностическую команду через cluster `0xFC02`. Ошибка очищается во flash только после успешного TX confirm диагностической команды; счётчик при этом сохраняется.
+
+Диагностический payload version `2`: version (1 байт), error code little-endian (2 байта) и persistent error sequence little-endian (4 байта). Converter публикует поля `error` и `error_sequence`, а старый трёхбайтовый payload version `1` продолжает принимать для совместимости. Коды `61001`–`61255` означают `ERROR_TX_CONFIRM_0x01`–`ERROR_TX_CONFIRM_0xFF`; остальные коды `60001`–`60014` имеют отдельные символические имена в converter.
 
 TX confirm означает завершение передачи со стороны локального Zigbee-стека, а не подтверждение обработки от Zigbee2MQTT. MAC retries при плохой связи возможны.

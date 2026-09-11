@@ -5,8 +5,6 @@
 #include <limits>
 
 #include "esphome/core/application.h"
-#include "esphome/core/log.h"
-
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 
@@ -15,7 +13,24 @@ namespace esphome {
 namespace zigbee_batch {
 
 
-static const char *const TAG = "zigbee_batch";
+static constexpr uint32_t LEGACY_ERROR_PREFERENCE_KEY = 0x6E7A4245U;
+static constexpr uint32_t RESTART_COOLDOWN_PREFERENCE_KEY = 0x6E7A4246U;
+static constexpr uint32_t DIAGNOSTIC_PREFERENCE_KEY = 0x6E7A4247U;
+
+static constexpr uint16_t ERROR_COMPONENT_NULL = 60001;
+static constexpr uint16_t ERROR_STACK_NOT_STARTED = 60002;
+static constexpr uint16_t ERROR_NOT_JOINED = 60003;
+static constexpr uint16_t ERROR_TX_BUSY = 60004;
+static constexpr uint16_t ERROR_LOCK_FAILED = 60005;
+static constexpr uint16_t ERROR_QUEUE_FAILED = 60006;
+static constexpr uint16_t ERROR_CONFIRM_NULL = 60008;
+static constexpr uint16_t ERROR_PARENT_LINK_FAILURE = 60011;
+static constexpr uint16_t ERROR_DEVICE_REBOOT_FAILED = 60012;
+static constexpr uint16_t ERROR_CONFIG_LOCK_FAILED = 60013;
+static constexpr uint16_t ERROR_DIAGNOSTIC_QUEUE_FAILED = 60014;
+static constexpr uint16_t ERROR_CONFIRM_STATUS_BASE = 61000;
+
+ZigbeeBatchComponent *ZigbeeBatchComponent::instance_ = nullptr;
 
 
 static void put_u16_le(uint8_t *dst, uint16_t value) {
@@ -37,22 +52,166 @@ static uint32_t now_ms_32() {
 }
 
 
-void ZigbeeBatchComponent::dump_config() {
-  ESP_LOGCONFIG(
-      TAG,
-      "Zigbee Batch:\n"
-      "  Source endpoint: %u\n"
-      "  Destination endpoint: %u\n"
-      "  Cluster: 0x%04X\n"
-      "  Command: 0x%02X\n"
-      "  Payload version: %u\n"
-      "  Payload size: %u bytes",
-      this->endpoint_,
-      this->destination_endpoint_,
-      this->cluster_id_,
-      this->command_id_,
-      PAYLOAD_VERSION,
-      static_cast<unsigned>(PAYLOAD_SIZE));
+void ZigbeeBatchComponent::setup() {
+  this->diagnostic_preference_ =
+      global_preferences->make_preference<DiagnosticState>(
+          DIAGNOSTIC_PREFERENCE_KEY);
+  this->restart_cooldown_preference_ =
+      global_preferences->make_preference<bool>(
+          RESTART_COOLDOWN_PREFERENCE_KEY);
+
+  DiagnosticState stored_diagnostic{};
+  if (this->diagnostic_preference_.load(&stored_diagnostic)) {
+    this->first_error_code_.store(stored_diagnostic.code,
+                                  std::memory_order_release);
+    this->error_sequence_.store(stored_diagnostic.sequence,
+                                std::memory_order_release);
+  } else {
+    auto legacy_error_preference =
+        global_preferences->make_preference<uint16_t>(
+            LEGACY_ERROR_PREFERENCE_KEY);
+    uint16_t legacy_error = 0;
+    if (legacy_error_preference.load(&legacy_error) && legacy_error != 0) {
+      this->first_error_code_.store(legacy_error,
+                                    std::memory_order_release);
+      this->error_sequence_.store(1, std::memory_order_release);
+      this->save_diagnostic_state_(legacy_error, 1);
+    }
+  }
+
+  bool restart_cooldown = false;
+  if (this->restart_cooldown_preference_.load(&restart_cooldown))
+    this->restart_cooldown_.store(restart_cooldown,
+                                  std::memory_order_release);
+
+  // 2048 minutes is the smallest supported timeout that is at least one day.
+  // Keepalive matches the normal measurement period, so this does not add
+  // periodic radio wakeups. Never wait indefinitely for the Zigbee lock.
+  if (esp_zigbee_lock_acquire(pdMS_TO_TICKS(50))) {
+    ezb_nwk_set_ed_timeout(EZB_NWK_ED_TIMEOUT_2048MIN);
+    ezb_nwk_set_keepalive_interval(600000U);
+    ezb_nwk_set_rx_on_when_idle(false);
+    esp_zigbee_lock_release();
+  } else {
+    this->record_error(ERROR_CONFIG_LOCK_FAILED);
+  }
+
+  instance_ = this;
+  ezb_app_signal_add_handler(ZigbeeBatchComponent::app_signal_handler_);
+}
+
+
+void ZigbeeBatchComponent::save_diagnostic_state_(uint16_t code,
+                                                   uint32_t sequence) {
+  const DiagnosticState state{code, sequence};
+  this->diagnostic_preference_.save(&state);
+  global_preferences->sync();
+}
+
+
+void ZigbeeBatchComponent::record_error(uint16_t code) {
+  if (code == 0)
+    return;
+
+  uint16_t expected = 0;
+  if (!this->first_error_code_.compare_exchange_strong(
+          expected, code, std::memory_order_acq_rel,
+          std::memory_order_acquire))
+    return;
+
+  uint32_t sequence = this->error_sequence_.load(std::memory_order_relaxed);
+  sequence = sequence == std::numeric_limits<uint32_t>::max()
+                 ? 1
+                 : sequence + 1;
+  this->error_sequence_.store(sequence, std::memory_order_release);
+  this->save_diagnostic_state_(code, sequence);
+}
+
+
+void ZigbeeBatchComponent::prepare_restart(uint16_t code) {
+  this->record_error(code);
+  const bool restart_cooldown = true;
+  this->restart_cooldown_.store(true, std::memory_order_release);
+  this->restart_cooldown_preference_.save(&restart_cooldown);
+  global_preferences->sync();
+}
+
+
+bool ZigbeeBatchComponent::consume_restart_cooldown() {
+  if (!this->restart_cooldown_.exchange(false, std::memory_order_acq_rel))
+    return false;
+
+  const bool restart_cooldown = false;
+  this->restart_cooldown_preference_.save(&restart_cooldown);
+  global_preferences->sync();
+  return true;
+}
+
+
+void ZigbeeBatchComponent::clear_error_() {
+  const uint16_t cleared = 0;
+  this->first_error_code_.store(cleared, std::memory_order_release);
+  this->save_diagnostic_state_(cleared, this->error_sequence());
+}
+
+
+void ZigbeeBatchComponent::queue_callback_error_(uint16_t code) {
+  if (code == 0)
+    return;
+  uint16_t expected = 0;
+  this->callback_error_code_.compare_exchange_strong(
+      expected, code, std::memory_order_acq_rel,
+      std::memory_order_acquire);
+}
+
+
+void ZigbeeBatchComponent::commit_callback_error_() {
+  const uint16_t code =
+      this->callback_error_code_.exchange(0, std::memory_order_acq_rel);
+  this->record_error(code);
+}
+
+
+void ZigbeeBatchComponent::finish_tx() {
+  const uint16_t transmitted =
+      this->transmitted_error_code_.exchange(0, std::memory_order_acq_rel);
+  const uint32_t transmitted_sequence =
+      this->transmitted_error_sequence_.exchange(
+          0, std::memory_order_acq_rel);
+  if (this->last_tx_success() && transmitted != 0 &&
+      this->first_error_code() == transmitted &&
+      this->error_sequence() == transmitted_sequence) {
+    this->clear_error_();
+  }
+
+  // If a new failure occurred while an older diagnostic was being delivered,
+  // preserve the new one after the delivered code has been cleared.
+  this->commit_callback_error_();
+
+}
+
+
+bool ZigbeeBatchComponent::app_signal_handler_(
+    const ezb_app_signal_t *app_signal) {
+  auto *self = instance_;
+  if (self == nullptr || app_signal == nullptr)
+    return true;
+
+  const ezb_app_signal_type_t type = ezb_app_signal_get_type(app_signal);
+  if (type == EZB_NWK_SIGNAL_NETWORK_STATUS) {
+    const auto *params = static_cast<const ezb_nwk_signal_network_status_params_t *>(
+        ezb_app_signal_get_params(app_signal));
+    if (params != nullptr &&
+        params->status == EZB_NWK_NETWORK_STATUS_PARENT_LINK_FAILURE) {
+      self->queue_callback_error_(ERROR_PARENT_LINK_FAILURE);
+    }
+  } else if (type == EZB_BDB_SIGNAL_DEVICE_REBOOT) {
+    const auto *status = static_cast<const ezb_bdb_comm_status_t *>(
+        ezb_app_signal_get_params(app_signal));
+    if (status != nullptr && *status != EZB_BDB_STATUS_SUCCESS)
+      self->queue_callback_error_(ERROR_DEVICE_REBOOT_FAILED);
+  }
+  return true;
 }
 
 
@@ -148,25 +307,30 @@ bool ZigbeeBatchComponent::send(
     float uptime_s,
     uint32_t previous_tx_wait_ms,
     bool previous_tx_wait_valid) {
+  this->commit_callback_error_();
+
   if (this->zb_ == nullptr) {
-    ESP_LOGW(TAG, "Cannot send: Zigbee component is null");
+    this->record_error(ERROR_COMPONENT_NULL);
     return false;
   }
   if (!this->zb_->is_started()) {
-    ESP_LOGW(TAG, "Cannot send: Zigbee stack not started");
+    this->record_error(ERROR_STACK_NOT_STARTED);
     return false;
   }
   if (!this->zb_->is_joined()) {
-    ESP_LOGW(TAG, "Cannot send: device is not joined");
+    this->record_error(ERROR_NOT_JOINED);
     return false;
   }
 
   uint8_t expected = 0;
   if (!this->tx_pending_.compare_exchange_strong(
           expected, 1, std::memory_order_acq_rel, std::memory_order_acquire)) {
-    ESP_LOGW(TAG, "Cannot send: previous batch TX is still pending");
+    this->record_error(ERROR_TX_BUSY);
     return false;
   }
+
+  this->transmitted_error_code_.store(0, std::memory_order_release);
+  this->transmitted_error_sequence_.store(0, std::memory_order_release);
 
   this->build_payload_(temperature_c, humidity_pct, battery_voltage_v,
                        battery_pct, uptime_s, previous_tx_wait_ms,
@@ -175,7 +339,10 @@ bool ZigbeeBatchComponent::send(
   this->tx_started_ms_.store(now_ms_32(), std::memory_order_relaxed);
 
   if (!esp_zigbee_lock_acquire(pdMS_TO_TICKS(50))) {
-    ESP_LOGW(TAG, "Could not acquire Zigbee lock");
+    this->record_error(ERROR_LOCK_FAILED);
+    this->transmitted_error_code_.store(0, std::memory_order_release);
+    this->transmitted_error_sequence_.store(0,
+                                             std::memory_order_release);
     this->tx_pending_.store(0, std::memory_order_release);
     return false;
   }
@@ -199,19 +366,49 @@ bool ZigbeeBatchComponent::send(
   esp_zigbee_lock_release();
 
   if (err != EZB_ERR_NONE) {
-    ESP_LOGW(TAG, "Could not queue custom Zigbee batch: 0x%X",
-             static_cast<unsigned>(err));
+    this->record_error(ERROR_QUEUE_FAILED);
+    this->transmitted_error_code_.store(0, std::memory_order_release);
+    this->transmitted_error_sequence_.store(0,
+                                             std::memory_order_release);
     this->tx_pending_.store(0, std::memory_order_release);
     return false;
   }
-
-  ESP_LOGD(TAG,
-           "Queued batch: temp=%.2f humidity=%.2f battery=%.3fV/%.0f%% "
-           "uptime=%.0fs previous_wait=%s%ums",
-           temperature_c, humidity_pct, battery_voltage_v, battery_pct,
-           uptime_s, previous_tx_wait_valid ? "" : "invalid/",
-           static_cast<unsigned>(previous_tx_wait_ms));
   return true;
+}
+
+
+bool ZigbeeBatchComponent::queue_diagnostic_(uint16_t code,
+                                             uint32_t sequence) {
+  this->diagnostic_payload_[0] = DIAGNOSTIC_PAYLOAD_VERSION;
+  put_u16_le(&this->diagnostic_payload_[1], code);
+  put_u32_le(&this->diagnostic_payload_[3], sequence);
+
+  ezb_zcl_custom_cluster_cmd_t cmd = {};
+  cmd.cmd_ctrl.fc.direction = EZB_ZCL_CMD_DIRECTION_TO_CLI;
+  cmd.cmd_ctrl.fc.dis_default_rsp = 1;
+  cmd.cmd_ctrl.fc.manuf_specific = 0;
+  cmd.cmd_ctrl.dst_addr.addr_mode = EZB_ADDR_MODE_SHORT;
+  cmd.cmd_ctrl.dst_addr.u.short_addr = 0x0000;
+  cmd.cmd_ctrl.src_ep = this->endpoint_;
+  cmd.cmd_ctrl.dst_ep = this->destination_endpoint_;
+  cmd.cmd_ctrl.cluster_id = this->diagnostic_cluster_id_;
+  cmd.cmd_ctrl.cnf_ctx.cb = &ZigbeeBatchComponent::tx_confirm_;
+  cmd.cmd_ctrl.cnf_ctx.user_ctx = this;
+  cmd.cmd_id = this->command_id_;
+  cmd.data_length = static_cast<uint16_t>(this->diagnostic_payload_.size());
+  cmd.data = this->diagnostic_payload_.data();
+
+  this->transmitted_error_code_.store(code, std::memory_order_release);
+  this->transmitted_error_sequence_.store(sequence,
+                                           std::memory_order_release);
+  const ezb_err_t err = ezb_zcl_custom_cluster_cmd_req(&cmd);
+  if (err == EZB_ERR_NONE)
+    return true;
+
+  this->transmitted_error_code_.store(0, std::memory_order_release);
+  this->transmitted_error_sequence_.store(0, std::memory_order_release);
+  this->queue_callback_error_(ERROR_DIAGNOSTIC_QUEUE_FAILED);
+  return false;
 }
 
 
@@ -230,14 +427,24 @@ void ZigbeeBatchComponent::tx_confirm_(ezb_zcl_cmd_cnf_t *cnf,
     status = static_cast<uint8_t>(cnf->status);
   self->last_tx_status_.store(status, std::memory_order_relaxed);
 
+  // A saved diagnostic is appended only after the regular batch succeeded.
+  // This runs inside the Zigbee callback, so no additional application-side
+  // wait or lock acquisition is needed. Keep TX pending until both commands
+  // have completed.
+  if (cnf != nullptr && cnf->status == 0 &&
+      self->transmitted_error_code_.load(std::memory_order_acquire) == 0) {
+    const uint16_t diagnostic = self->first_error_code();
+    const uint32_t sequence = self->error_sequence();
+    if (diagnostic != 0 &&
+        self->queue_diagnostic_(diagnostic, sequence))
+      return;
+  }
+
   if (cnf == nullptr) {
-    ESP_LOGW(TAG, "Batch TX confirmation is null");
+    self->queue_callback_error_(ERROR_CONFIRM_NULL);
   } else if (cnf->status != 0) {
-    ESP_LOGW(TAG, "Batch TX failed, status=0x%02X, latency=%ums",
-             static_cast<unsigned>(cnf->status),
-             static_cast<unsigned>(elapsed));
-  } else {
-    ESP_LOGD(TAG, "Batch TX confirmed in %ums", static_cast<unsigned>(elapsed));
+    self->queue_callback_error_(static_cast<uint16_t>(
+        ERROR_CONFIRM_STATUS_BASE + static_cast<uint8_t>(cnf->status)));
   }
 
   // Release last. is_idle() uses acquire semantics, so observing idle=true

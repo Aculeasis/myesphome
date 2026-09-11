@@ -13,6 +13,7 @@ CONF_ZIGBEE_ID = "zigbee_id"
 CONF_ENDPOINT = "endpoint"
 CONF_DESTINATION_ENDPOINT = "destination_endpoint"
 CONF_CLUSTER_ID = "cluster_id"
+CONF_DIAGNOSTIC_CLUSTER_ID = "diagnostic_cluster_id"
 CONF_COMMAND_ID = "command_id"
 
 
@@ -42,6 +43,9 @@ CONFIG_SCHEMA = cv.All(
             cv.Optional(CONF_CLUSTER_ID, default=0xFC01):
                 cv.int_range(min=0xFC01, max=0xFFFF),
 
+            cv.Optional(CONF_DIAGNOSTIC_CLUSTER_ID, default=0xFC02):
+                cv.int_range(min=0xFC01, max=0xFFFF),
+
             cv.Optional(CONF_COMMAND_ID, default=0x00):
                 cv.int_range(min=0, max=0xFF),
         }
@@ -61,6 +65,11 @@ async def to_code(config):
             f"(available: {sorted(endpoints)})."
         )
 
+    if config[CONF_CLUSTER_ID] == config[CONF_DIAGNOSTIC_CLUSTER_ID]:
+        raise cv.Invalid(
+            "zigbee_batch data and diagnostic cluster IDs must differ"
+        )
+
     var = cg.new_Pvariable(config[CONF_ID])
     await cg.register_component(var, config)
 
@@ -74,6 +83,11 @@ async def to_code(config):
         )
     )
     cg.add(var.set_cluster_id(config[CONF_CLUSTER_ID]))
+    cg.add(
+        var.set_diagnostic_cluster_id(
+            config[CONF_DIAGNOSTIC_CLUSTER_ID]
+        )
+    )
     cg.add(var.set_command_id(config[CONF_COMMAND_ID]))
 
     # The selected endpoint is created by the Zigbee component before runtime
@@ -82,6 +96,13 @@ async def to_code(config):
         zb.add_cluster(
             config[CONF_ENDPOINT],
             config[CONF_CLUSTER_ID],
+            cg.RawExpression("EZB_ZCL_CLUSTER_SERVER"),
+        )
+    )
+    cg.add(
+        zb.add_cluster(
+            config[CONF_ENDPOINT],
+            config[CONF_DIAGNOSTIC_CLUSTER_ID],
             cg.RawExpression("EZB_ZCL_CLUSTER_SERVER"),
         )
     )

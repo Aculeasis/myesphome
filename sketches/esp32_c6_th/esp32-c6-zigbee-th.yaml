@@ -1,6 +1,7 @@
 external_components:
   - source: github://Aculeasis/myesphome
     components: [zigbee_batch]
+    refresh: 0s
 
 substitutions:
   name: "esp32-c6-zigbee-th"
@@ -23,6 +24,9 @@ esp32:
   cpu_frequency: 80MHz
   framework:
     type: esp-idf
+    log_level: NONE
+    advanced:
+      assertion_level: SILENT
 
 logger:
   baud_rate: 0
@@ -75,6 +79,7 @@ zigbee_batch:
   destination_endpoint: 1
 
   cluster_id: 0xFC01
+  diagnostic_cluster_id: 0xFC02
   command_id: 0x00
 
 # --------------------------------------------------------------------------
@@ -293,6 +298,7 @@ script:
     mode: restart
     then:
       - delay: 120s
+      - lambda: 'id(zb_batch).prepare_restart(60010);'
       - button.press: emergency_restart
 
   # Enter the main 10-minute light sleep and classify its result. A sleep
@@ -360,6 +366,7 @@ script:
                 condition:
                   lambda: 'return id(wakeup_reason) < 0;'
                 then:
+                  - lambda: 'id(zb_batch).prepare_restart(60009);'
                   - button.press: emergency_restart
 
   # Classify a GPIO wake by pin level instead of relying on binary_sensor edge
@@ -393,6 +400,22 @@ script:
           condition:
             lambda: 'return id(is_joined) && id(sleep_allowed);'
           then:
+            # A TX timeout sets a persistent cooldown before restarting. Sleep
+            # for one normal period before the first retry, preventing a rapid
+            # reboot loop while keeping GPIO9 available as a wake source.
+            - if:
+                condition:
+                  lambda: 'return id(zb_batch).consume_restart_cooldown();'
+                then:
+                  - script.execute: sleep_cycle
+                  - script.wait: sleep_cycle
+                  - if:
+                      condition:
+                        lambda: 'return id(wakeup_reason) == 1;'
+                      then:
+                        - script.execute: handle_button_wakeup
+                        - script.wait: handle_button_wakeup
+
             - script.execute: awake_safety_guard
 
             - if:
@@ -481,33 +504,15 @@ script:
                       id(zb_last_wait_ms) = elapsed_ms;
                       id(zb_last_wait_valid) = true;
 
-                      ESP_LOGD(
-                          "zigbee_batch",
-                          "wait_until latency=%ums, confirm latency=%ums, "
-                          "TX status=0x%02X",
-                          static_cast<unsigned>(id(zb_last_wait_ms)),
-                          static_cast<unsigned>(
-                              id(zb_batch).last_confirm_latency_ms()),
-                          static_cast<unsigned>(id(zb_batch).last_tx_status()));
-
                   # Do not enter light sleep with a command still outstanding.
                   - if:
                       condition:
                         lambda: 'return !id(zb_batch).is_idle();'
                       then:
-                        - lambda: |-
-                            ESP_LOGE(
-                                "zigbee_batch",
-                                "TX still pending after 5s; restarting instead of sleeping");
+                        - lambda: 'id(zb_batch).prepare_restart(60007);'
                         - button.press: emergency_restart
-
-                else:
-                  # send() failed before the command was queued. Preserve the last
-                  # real wait latency for the next attempt.
-                  - lambda: |-
-                      ESP_LOGW(
-                          "zigbee_batch",
-                          "Batch packet was not queued; preserving previous wait latency");
+                      else:
+                        - lambda: 'id(zb_batch).finish_tx();'
 
             - switch.turn_off: status_led
 
@@ -578,12 +583,12 @@ sensor:
           method: exact
           datapoints:
             - 3.10 -> 0.0
-            - 3.50 -> 10.0
-            - 3.65 -> 25.0
-            - 3.75 -> 50.0
-            - 3.85 -> 75.0
-            - 4.00 -> 90.0
-            - 4.15 -> 100.0
+            - 3.50 -> 25.0
+            - 3.65 -> 37.5
+            - 3.75 -> 58.3
+            - 3.85 -> 79.2
+            - 4.00 -> 91.7
+            - 4.17 -> 100.0
       - clamp:
           min_value: 0.0
           max_value: 100.0
