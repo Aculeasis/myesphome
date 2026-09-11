@@ -91,6 +91,7 @@ void ZigbeeBatchComponent::setup() {
     ezb_nwk_set_ed_timeout(EZB_NWK_ED_TIMEOUT_2048MIN);
     ezb_nwk_set_keepalive_interval(600000U);
     ezb_nwk_set_rx_on_when_idle(false);
+    ezb_nwk_set_fast_poll_interval(30U);
     esp_zigbee_lock_release();
   } else {
     this->record_error(ERROR_CONFIG_LOCK_FAILED);
