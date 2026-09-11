@@ -7,6 +7,17 @@ const BATCH_CLUSTER_ID = 0xfc01;
 const DIAGNOSTIC_CLUSTER_ID = 0xfc02;
 const BATCH_COMMAND_ID = 0x00;
 
+// Must match zigbee_batch.data in the ESPHome sketch. Flag bits are assigned
+// in this order; only values whose bit is set occupy bytes in the payload.
+const DATA_FIELDS = [
+    {name: 'temperature', type: 'int16', divisor: 100},
+    {name: 'humidity', type: 'uint16', divisor: 100},
+    {name: 'battery_voltage', type: 'uint16', divisor: 1000},
+    {name: 'battery', type: 'uint8', divisor: 1},
+    {name: 'uptime', type: 'uint32', divisor: 1},
+    {name: 'previous_tx_wait', type: 'uint16', divisor: 1},
+];
+
 const ERROR_NAMES = new Map([
     [60001, 'ERROR_COMPONENT_NULL'],
     [60002, 'ERROR_STACK_NOT_STARTED'],
@@ -22,6 +33,12 @@ const ERROR_NAMES = new Map([
     [60012, 'ERROR_DEVICE_REBOOT_FAILED'],
     [60013, 'ERROR_CONFIG_LOCK_FAILED'],
     [60014, 'ERROR_DIAGNOSTIC_QUEUE_FAILED'],
+    [60015, 'ERROR_PAYLOAD_INCOMPLETE'],
+    [60016, 'ERROR_TX_CONTEXT_EXHAUSTED'],
+    [60017, 'ERROR_REJOIN_FAILED'],
+    [60018, 'ERROR_PM_CONFIG_FAILED'],
+    [60019, 'ERROR_BUTTON_IRQ_FAILED'],
+    [61008, 'ERROR_TARGET_ADDRESS_UNALLOCATED'],
 ]);
 
 function payloadBytes(msg) {
@@ -45,18 +62,51 @@ function payloadBytes(msg) {
     return null;
 }
 
-function batchPayload(data) {
-    if (!data) return null;
-    if (data.length === 15 && data[0] === 1) return data;
+function typeSize(type) {
+    if (type === 'uint8' || type === 'int8') return 1;
+    if (type === 'uint16' || type === 'int16') return 2;
+    return 4;
+}
 
-    // An unknown command can be delivered by zigbee-herdsman as raw ZCL
-    // bytes: frame control, transaction sequence, command id, payload.
-    if (data.length >= 18 && data[2] === BATCH_COMMAND_ID) {
-        const payload = data.subarray(3, 18);
-        if (payload[0] === 1) return payload;
+function readValue(data, offset, type) {
+    if (type === 'uint8') return data.readUInt8(offset);
+    if (type === 'int8') return data.readInt8(offset);
+    if (type === 'uint16') return data.readUInt16LE(offset);
+    if (type === 'int16') return data.readInt16LE(offset);
+    if (type === 'uint32') return data.readUInt32LE(offset);
+    if (type === 'int32') return data.readInt32LE(offset);
+    return null;
+}
+
+function decodeFlexiblePayload(data) {
+    if (!data || data.length < 1) return null;
+
+    const flags = [];
+    let offset = 0;
+    do {
+        if (offset >= data.length || flags.length >= 3) return null;
+        flags.push(data[offset++]);
+    } while ((flags[flags.length - 1] & 0x80) !== 0);
+
+    if (flags.length !== Math.max(1, Math.ceil(DATA_FIELDS.length / 7))) {
+        return null;
     }
 
-    return null;
+    const result = {};
+    for (let index = 0; index < DATA_FIELDS.length; index++) {
+        const present = (flags[Math.floor(index / 7)] &
+            (1 << (index % 7))) !== 0;
+        if (!present) continue;
+
+        const field = DATA_FIELDS[index];
+        const size = typeSize(field.type);
+        if (offset + size > data.length) return null;
+        result[field.name] = readValue(data, offset, field.type) /
+            field.divisor;
+        offset += size;
+    }
+
+    return offset === data.length ? result : null;
 }
 
 function diagnosticPayload(data) {
@@ -85,18 +135,17 @@ function decodeBatch(model, msg) {
 
     if (msg.type !== 'raw') return;
 
-    const data = batchPayload(payloadBytes(msg));
-    if (!data) return;
+    const bytes = payloadBytes(msg);
+    if (!bytes) return;
 
-    const flags = data[1];
-    const result = {};
-
-    if (flags & (1 << 0)) result.temperature = data.readInt16LE(2) / 100.0;
-    if (flags & (1 << 1)) result.humidity = data.readUInt16LE(4) / 100.0;
-    if (flags & (1 << 2)) result.battery_voltage = data.readUInt16LE(6) / 1000.0;
-    if (flags & (1 << 3)) result.battery = data.readUInt8(8);
-    if (flags & (1 << 4)) result.uptime = data.readUInt32LE(9);
-    if (flags & (1 << 5)) result.previous_tx_wait = data.readUInt16LE(13);
+    // Depending on zigbee-herdsman version, an unknown command is delivered
+    // either as its payload or as frame-control, TSN, command-id, payload.
+    let result = decodeFlexiblePayload(bytes);
+    if (result === null && bytes.length >= 4 &&
+        bytes[2] === BATCH_COMMAND_ID) {
+        result = decodeFlexiblePayload(bytes.subarray(3));
+    }
+    if (result === null) return;
 
     return Object.keys(result).length > 0 ? result : undefined;
 }

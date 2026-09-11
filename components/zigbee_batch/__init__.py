@@ -2,6 +2,7 @@ import esphome.codegen as cg
 import esphome.config_validation as cv
 
 from esphome.const import CONF_ID
+from esphome.components import esp32
 from esphome.components.zigbee.const import KEY_ZIGBEE, ZigbeeComponent
 from esphome.components.zigbee.const_esp32 import KEY_ZIGBEE_EP
 from esphome.core import CORE
@@ -15,6 +16,11 @@ CONF_DESTINATION_ENDPOINT = "destination_endpoint"
 CONF_CLUSTER_ID = "cluster_id"
 CONF_DIAGNOSTIC_CLUSTER_ID = "diagnostic_cluster_id"
 CONF_COMMAND_ID = "command_id"
+CONF_DATA = "data"
+CONF_NONCRITICAL_ERROR_LIMIT = "noncritical_error_limit"
+CONF_WAKEUP_PIN = "wakeup_pin"
+
+MAX_DATA_FIELDS = 21
 
 
 zigbee_batch_ns = cg.esphome_ns.namespace("zigbee_batch")
@@ -23,6 +29,16 @@ ZigbeeBatchComponent = zigbee_batch_ns.class_(
     "ZigbeeBatchComponent",
     cg.Component,
 )
+DataType = zigbee_batch_ns.enum("DataType", is_class=True)
+
+DATA_TYPES = {
+    "uint8_t": DataType.UINT8,
+    "uint16_t": DataType.UINT16,
+    "uint32_t": DataType.UINT32,
+    "int8_t": DataType.INT8,
+    "int16_t": DataType.INT16,
+    "int32_t": DataType.INT32,
+}
 
 
 def _validate_cluster_ids(config):
@@ -31,6 +47,15 @@ def _validate_cluster_ids(config):
             "zigbee_batch data and diagnostic cluster IDs must differ"
         )
     return config
+
+
+def _validate_data_fields(value):
+    fields = cv.ensure_list(cv.enum(DATA_TYPES, lower=True))(value)
+    if len(fields) > MAX_DATA_FIELDS:
+        raise cv.Invalid(
+            f"zigbee_batch supports at most {MAX_DATA_FIELDS} data fields"
+        )
+    return fields
 
 
 CONFIG_SCHEMA = cv.All(
@@ -56,6 +81,13 @@ CONFIG_SCHEMA = cv.All(
 
             cv.Optional(CONF_COMMAND_ID, default=0x00):
                 cv.int_range(min=0, max=0xFF),
+
+            cv.Optional(CONF_DATA, default=[]): _validate_data_fields,
+
+            cv.Optional(CONF_NONCRITICAL_ERROR_LIMIT, default=5):
+                cv.int_range(min=1, max=16),
+
+            cv.Optional(CONF_WAKEUP_PIN): cv.int_range(min=0, max=30),
         }
     ).extend(cv.COMPONENT_SCHEMA),
     cv.only_on_esp32,
@@ -93,6 +125,23 @@ async def to_code(config):
         )
     )
     cg.add(var.set_command_id(config[CONF_COMMAND_ID]))
+    cg.add(var.set_data_field_count(len(config[CONF_DATA])))
+    for index, data_type in enumerate(config[CONF_DATA]):
+        cg.add(var.set_data_type(index, data_type))
+    cg.add(
+        var.set_noncritical_error_limit(
+            config[CONF_NONCRITICAL_ERROR_LIMIT]
+        )
+    )
+    if CONF_WAKEUP_PIN in config:
+        cg.add(var.set_wakeup_pin(config[CONF_WAKEUP_PIN]))
+
+    # Zigbee v2 uses ESP-IDF tickless idle for stack-aware light sleep. This
+    # lets its keepalive deadline wake the chip independently of measurements.
+    esp32.add_idf_sdkconfig_option("CONFIG_PM_ENABLE", True)
+    esp32.add_idf_sdkconfig_option(
+        "CONFIG_FREERTOS_USE_TICKLESS_IDLE", True
+    )
 
     # The selected endpoint is created by the Zigbee component before runtime
     # setup registers the device descriptor with the stack.
