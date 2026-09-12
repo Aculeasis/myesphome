@@ -110,16 +110,13 @@ function decodeFlexiblePayload(data) {
 }
 
 function diagnosticPayload(data) {
-    if (!data) return null;
-    if (data.length === 3 && data[0] === 1) return data;
-    if (data.length === 7 && data[0] === 2) return data;
+    if (!data || data.length < 6) return null;
+    if (data[2] !== BATCH_COMMAND_ID) return null;
 
-    if (data.length >= 6 && data[2] === BATCH_COMMAND_ID) {
-        const version = data[3];
-        const payloadLength = version === 1 ? 3 : version === 2 ? 7 : 0;
-        if (payloadLength !== 0 && data.length >= 3 + payloadLength) {
-            return data.subarray(3, 3 + payloadLength);
-        }
+    const version = data[3];
+    const payloadLength = version === 1 ? 3 : version === 2 ? 7 : 0;
+    if (payloadLength !== 0 && data.length >= 3 + payloadLength) {
+        return data.subarray(3, 3 + payloadLength);
     }
 
     return null;
@@ -136,16 +133,11 @@ function decodeBatch(model, msg) {
     if (msg.type !== 'raw') return;
 
     const bytes = payloadBytes(msg);
-    if (!bytes) return;
+    if (!bytes || bytes.length < 4) return;
+    if (bytes[2] !== BATCH_COMMAND_ID) return;
 
-    // Depending on zigbee-herdsman version, an unknown command is delivered
-    // either as its payload or as frame-control, TSN, command-id, payload.
-    let result = decodeFlexiblePayload(bytes);
-    if (result === null && bytes.length >= 4 &&
-        bytes[2] === BATCH_COMMAND_ID) {
-        result = decodeFlexiblePayload(bytes.subarray(3));
-    }
-    if (result === null) return;
+    const result = decodeFlexiblePayload(bytes.subarray(3));
+    if (!result) return;
 
     return Object.keys(result).length > 0 ? result : undefined;
 }
