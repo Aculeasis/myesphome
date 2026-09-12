@@ -12,3 +12,7 @@ Adding ANY delays (`delay` actions, `delay()` calls, or equivalent awake waits)
 to its main measurement/sleep cycle is STRICTLY PROHIBITED. Preserve light
 sleep during sensor warmup and other existing power-saving behavior.
 
+Model `ptvo.switch` is intentional: a known built-in model prevents Z2M from
+querying the sleeping device on startup before external converters load, which
+hangs Z2M and triggers HAOS watchdog kill. Do not change it.
+

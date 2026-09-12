@@ -57,6 +57,9 @@ class ZigbeeBatchComponent : public Component {
   // Unchanged values are automatically omitted.
   void begin();
   void add(float value);
+  void add(double value);
+  void add(uint32_t value);
+  void add(int32_t value);
   void skip();
   bool send();
 
@@ -71,16 +74,18 @@ class ZigbeeBatchComponent : public Component {
   }
   bool last_tx_success() const { return this->last_tx_status() == 0; }
 
-  // Stop waiting after the application timeout. A late callback keeps its own
-  // context and is ignored, so a later packet cannot be mistaken for it.
+  // Abandon a packet once its three-second confirm deadline has expired.
+  // A late callback keeps its own context and is ignored, so a later packet
+  // cannot be mistaken for it.
   void handle_confirm_timeout();
   void suspend_button_wakeup();
   void resume_button_wakeup();
-  // Block only the ESPHome main task. FreeRTOS tickless idle keeps the chip in
-  // automatic Light Sleep while the Zigbee task remains free to service its
-  // own keepalive/rejoin deadlines. Returns 0 at the regular deadline, 1 for
-  // a button wake, or 2 when the noncritical-error limit requires a restart.
-  int wait_until(int64_t deadline_us);
+  // Cooperatively sleep from loop(), yielding after each event so ESPHome can
+  // service GPIO filters, scheduled work and on_join before sleeping again.
+  void start_sleep(int64_t deadline_us);
+  void stop_sleep();
+  bool sleep_finished() const;
+  void start_tx_wait();
   void wait_for_duration(uint32_t duration_ms);
   bool restart_required() const {
     return this->restart_required_.load(std::memory_order_acquire);
@@ -110,6 +115,7 @@ class ZigbeeBatchComponent : public Component {
     std::atomic<uint8_t> state{TX_FREE};
     ZigbeeBatchComponent *owner{nullptr};
     bool diagnostic{false};
+    uint32_t started_ms{0};
     std::array<uint8_t, MAX_PAYLOAD_SIZE> payload{};
     uint16_t payload_size{0};
     uint32_t changed_mask{0};
@@ -135,7 +141,8 @@ class ZigbeeBatchComponent : public Component {
   void commit_sent_values_(const TxContext *context);
 
   static size_t data_type_size_(DataType type);
-  static uint32_t encode_value_(DataType type, float value);
+  static uint32_t encode_value_(DataType type, double value);
+  void add_value_(double value);
   static void put_value_(uint8_t *dst, uint32_t value, size_t size);
 
   void note_noncritical_error_(uint16_t code, bool callback_context);
@@ -143,6 +150,7 @@ class ZigbeeBatchComponent : public Component {
   void process_button_interrupt_();
   void arm_button_interrupt_();
   void service_pending_rejoin_();
+  void sleep_step_();
   void queue_callback_error_(uint16_t code);
   void commit_callback_error_();
   void clear_error_();
@@ -175,6 +183,13 @@ class ZigbeeBatchComponent : public Component {
   std::atomic<bool> restart_required_{false};
   std::atomic<bool> rejoin_requested_{false};
   std::atomic<bool> rejoin_in_progress_{false};
+  bool rejoin_retry_scheduled_{false};
+
+  bool sleeping_{false};
+  bool sleep_yield_pending_{false};
+  bool waiting_for_tx_{false};
+  int64_t sleep_deadline_us_{0};
+  uint32_t saved_loop_interval_{0};
 
   uint8_t wakeup_pin_{0xFF};
   bool button_handler_ready_{false};

@@ -1,0 +1,30 @@
+# Local dependency sources and temporary test/build artifacts
+/temp_sources/
+/temp/
+
+# ESPHome and PlatformIO generated files
+.esphome/
+.pio/
+
+# Python environments and caches
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+
+# JavaScript dependencies
+node_modules/
+
+# Local credentials
+secrets.yaml
+secrets.yml
+.env
+.env.*
+!.env.example
+
+# Operating system metadata
+.DS_Store
+Thumbs.db
+Desktop.ini

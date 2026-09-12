@@ -20,6 +20,7 @@ namespace zigbee_batch {
 static constexpr uint32_t LEGACY_ERROR_PREFERENCE_KEY = 0x6E7A4245U;
 static constexpr uint32_t RESTART_COOLDOWN_PREFERENCE_KEY = 0x6E7A4246U;
 static constexpr uint32_t DIAGNOSTIC_PREFERENCE_KEY = 0x6E7A4247U;
+static constexpr uint32_t CONFIRM_TIMEOUT_MS = 3000;
 
 static constexpr uint16_t ERROR_COMPONENT_NULL = 60001;
 static constexpr uint16_t ERROR_STACK_NOT_STARTED = 60002;
@@ -134,15 +135,30 @@ void ZigbeeBatchComponent::loop() {
     this->process_button_interrupt_();
 
   this->service_pending_rejoin_();
+  this->sleep_step_();
 }
 
 void ZigbeeBatchComponent::service_pending_rejoin_() {
-  if (this->rejoin_in_progress_.load(std::memory_order_acquire) ||
-      !this->rejoin_requested_.exchange(false, std::memory_order_acq_rel))
+  if (this->rejoin_retry_scheduled_ ||
+      this->rejoin_in_progress_.load(std::memory_order_acquire) ||
+      !this->rejoin_requested_.load(std::memory_order_acquire))
     return;
 
   if (!esp_zigbee_lock_acquire(pdMS_TO_TICKS(50))) {
-    this->rejoin_requested_.store(true, std::memory_order_release);
+    this->rejoin_retry_scheduled_ = true;
+    this->set_timeout("rejoin-retry", 100, [this]() {
+      this->rejoin_retry_scheduled_ = false;
+      this->enable_loop_soon_any_context();
+    });
+    return;
+  }
+
+  // A parent failure can arrive while the main task is acquiring the lock.
+  // Its native handler already owns recovery; do not issue a second request.
+  if (this->rejoin_in_progress_.load(std::memory_order_acquire) ||
+      !this->rejoin_requested_.exchange(false, std::memory_order_acq_rel)) {
+    this->rejoin_requested_.store(false, std::memory_order_release);
+    esp_zigbee_lock_release();
     return;
   }
 
@@ -167,34 +183,89 @@ void ZigbeeBatchComponent::service_pending_rejoin_() {
   }
 }
 
-int ZigbeeBatchComponent::wait_until(int64_t deadline_us) {
-  while (true) {
-    this->service_pending_rejoin_();
+void ZigbeeBatchComponent::start_sleep(int64_t deadline_us) {
+  if (!this->sleeping_)
+    this->saved_loop_interval_ = App.get_loop_interval();
+  this->sleeping_ = true;
+  this->waiting_for_tx_ = false;
+  this->sleep_deadline_us_ = deadline_us;
+  this->sleep_yield_pending_ = true;
+  // Our event/deadline wait replaces the normal 16ms loop pacing. In
+  // particular, do not add a second timed wake after every real event.
+  App.set_loop_interval(0);
+}
 
-    if (this->restart_required_.load(std::memory_order_acquire))
-      return 2;
+void ZigbeeBatchComponent::stop_sleep() {
+  if (!this->sleeping_)
+    return;
+  this->sleeping_ = false;
+  this->waiting_for_tx_ = false;
+  App.set_loop_interval(this->saved_loop_interval_);
+}
 
-    if (this->wakeup_pin_ != 0xFF &&
-        gpio_get_level(static_cast<gpio_num_t>(this->wakeup_pin_)) == 0)
-      return 1;
+bool ZigbeeBatchComponent::sleep_finished() const {
+  return this->restart_required() ||
+         (esp_timer_get_time() >= this->sleep_deadline_us_ &&
+          !this->rejoin_in_progress_.load(std::memory_order_acquire) &&
+          !this->rejoin_requested_.load(std::memory_order_acquire));
+}
 
-    const int64_t now_us = esp_timer_get_time();
-    const bool rejoining =
-        this->rejoin_in_progress_.load(std::memory_order_acquire);
-    if (now_us >= deadline_us && !rejoining)
-      return 0;
+void ZigbeeBatchComponent::start_tx_wait() {
+  this->start_sleep(0);
+  this->waiting_for_tx_ = true;
+}
 
-    uint64_t wait_ms;
-    if (now_us < deadline_us) {
-      wait_ms = static_cast<uint64_t>(deadline_us - now_us + 999LL) / 1000ULL;
-    } else {
-      // A rejoin already in progress owns its own Zigbee deadlines. This is
-      // only a safety ceiling; its completion signal normally wakes us sooner.
-      wait_ms = 600000ULL;
-    }
-    esphome::internal::wakeable_delay(static_cast<uint32_t>(std::min<uint64_t>(
-        wait_ms, std::numeric_limits<uint32_t>::max())));
+void ZigbeeBatchComponent::sleep_step_() {
+  if (!this->sleeping_)
+    return;
+  if (this->sleep_yield_pending_) {
+    // Allow a complete scheduler/component pass after a wake, independent of
+    // component order. This also lets the button sensor publish both edges.
+    this->sleep_yield_pending_ = false;
+    return;
   }
+
+  uint32_t wait_ms;
+  if (this->waiting_for_tx_) {
+    if (this->is_idle()) {
+      this->stop_sleep();
+      return;
+    }
+    this->handle_confirm_timeout();
+    if (this->is_idle()) {
+      this->stop_sleep();
+      return;
+    }
+    const auto *context = this->current_context_.load(std::memory_order_acquire);
+    // A callback owns a context only briefly and always wakes us on completion
+    // or when queuing diagnostics. Each packet has its own three-second budget.
+    wait_ms = CONFIRM_TIMEOUT_MS;
+    if (context != nullptr) {
+      const uint32_t elapsed = now_ms_32() - context->started_ms;
+      if (elapsed < CONFIRM_TIMEOUT_MS)
+        wait_ms -= elapsed;
+    }
+  } else {
+    if (this->sleep_finished()) {
+      this->stop_sleep();
+      return;
+    }
+    const int64_t remaining_us = this->sleep_deadline_us_ - esp_timer_get_time();
+    wait_ms = remaining_us > 0
+                  ? static_cast<uint32_t>(std::min<int64_t>(
+                        (remaining_us + 999LL) / 1000LL, UINT32_MAX))
+                  : 600000U;
+  }
+
+  // Include newly queued timers, including Zigbee's zb_init and GPIO debounce.
+  // Sleep to their actual deadline, never poll them at a fixed interval.
+  App.scheduler.process_to_add();
+  const auto scheduled = App.scheduler.next_schedule_in(now_ms_32());
+  if (scheduled.has_value())
+    wait_ms = std::min(wait_ms, *scheduled);
+  this->sleep_yield_pending_ = true;
+  if (wait_ms != 0)
+    esphome::internal::wakeable_delay(wait_ms);
 }
 
 void ZigbeeBatchComponent::wait_for_duration(uint32_t duration_ms) {
@@ -288,8 +359,8 @@ size_t ZigbeeBatchComponent::data_type_size_(DataType type) {
   }
 }
 
-uint32_t ZigbeeBatchComponent::encode_value_(DataType type, float value) {
-  const double rounded = std::round(static_cast<double>(value));
+uint32_t ZigbeeBatchComponent::encode_value_(DataType type, double value) {
+  const double rounded = std::round(value);
   switch (type) {
     case DataType::UINT8:
       return static_cast<uint8_t>(std::clamp(rounded, 0.0, 255.0));
@@ -315,6 +386,22 @@ uint32_t ZigbeeBatchComponent::encode_value_(DataType type, float value) {
 }
 
 void ZigbeeBatchComponent::add(float value) {
+  this->add_value_(value);
+}
+
+void ZigbeeBatchComponent::add(double value) {
+  this->add_value_(value);
+}
+
+void ZigbeeBatchComponent::add(uint32_t value) {
+  this->add_value_(value);
+}
+
+void ZigbeeBatchComponent::add(int32_t value) {
+  this->add_value_(value);
+}
+
+void ZigbeeBatchComponent::add_value_(double value) {
   if (this->builder_index_ >= this->data_field_count_) {
     this->record_error(ERROR_PAYLOAD_INCOMPLETE);
     return;
@@ -396,6 +483,7 @@ bool ZigbeeBatchComponent::send() {
   }
 
   context->diagnostic = false;
+  context->started_ms = now_ms_32();
   context->changed_mask = this->builder_changed_mask_;
   context->values = this->builder_values_;
   context->payload.fill(0);
@@ -481,7 +569,17 @@ bool ZigbeeBatchComponent::queue_context_(TxContext *context,
 bool ZigbeeBatchComponent::queue_diagnostic_(TxContext *context,
                                              uint16_t code,
                                              uint32_t sequence) {
+  // Use a distinct context: a timeout inspecting the data packet must never
+  // abandon the diagnostic packet that its callback has just queued.
+  TxContext *data_context = context;
+  context = this->acquire_tx_context_();
+  if (context == nullptr) {
+    this->queue_callback_error_(ERROR_TX_CONTEXT_EXHAUSTED);
+    this->restart_required_.store(true, std::memory_order_release);
+    return false;
+  }
   context->diagnostic = true;
+  context->started_ms = now_ms_32();
   context->payload[0] = DIAGNOSTIC_PAYLOAD_VERSION;
   this->put_value_(&context->payload[1], code, 2);
   this->put_value_(&context->payload[3], sequence, 4);
@@ -490,11 +588,16 @@ bool ZigbeeBatchComponent::queue_diagnostic_(TxContext *context,
   this->transmitted_error_sequence_.store(sequence,
                                            std::memory_order_release);
   context->state.store(TX_ACTIVE, std::memory_order_release);
+  this->current_context_.store(context, std::memory_order_release);
   // The confirm callback already runs in Zigbee stack context.
-  if (this->queue_context_(context, false))
+  if (this->queue_context_(context, false)) {
+    data_context->state.store(TX_FREE, std::memory_order_release);
+    App.wake_loop_threadsafe();
     return true;
+  }
 
-  context->state.store(TX_CALLBACK, std::memory_order_release);
+  this->current_context_.store(data_context, std::memory_order_release);
+  context->state.store(TX_FREE, std::memory_order_release);
   this->transmitted_error_code_.store(0, std::memory_order_release);
   this->transmitted_error_sequence_.store(0, std::memory_order_release);
   return false;
@@ -574,8 +677,9 @@ void ZigbeeBatchComponent::tx_confirm_(ezb_zcl_cmd_cnf_t *confirmation,
 
 void ZigbeeBatchComponent::handle_confirm_timeout() {
   TxContext *context =
-      this->current_context_.exchange(nullptr, std::memory_order_acq_rel);
-  if (context == nullptr)
+      this->current_context_.load(std::memory_order_acquire);
+  if (context == nullptr ||
+      now_ms_32() - context->started_ms < CONFIRM_TIMEOUT_MS)
     return;
 
   uint8_t expected = TX_ACTIVE;
@@ -584,6 +688,10 @@ void ZigbeeBatchComponent::handle_confirm_timeout() {
           std::memory_order_acquire))
     return;
 
+  TxContext *current = context;
+  this->current_context_.compare_exchange_strong(
+      current, nullptr, std::memory_order_acq_rel,
+      std::memory_order_acquire);
   this->transmitted_error_code_.store(0, std::memory_order_release);
   this->transmitted_error_sequence_.store(0, std::memory_order_release);
   this->last_tx_status_.store(0xFF, std::memory_order_relaxed);
@@ -704,7 +812,9 @@ bool ZigbeeBatchComponent::app_signal_handler_(
     if (params != nullptr &&
         params->status == EZB_NWK_NETWORK_STATUS_PARENT_LINK_FAILURE) {
       self->note_noncritical_error_(ERROR_PARENT_LINK_FAILURE, true);
-      self->rejoin_requested_.store(true, std::memory_order_release);
+      // ESPHome's Zigbee handler already issues leave(rejoin=true).
+      self->rejoin_requested_.store(false, std::memory_order_release);
+      self->rejoin_in_progress_.store(true, std::memory_order_release);
       App.wake_loop_threadsafe();
     }
   } else if (type == EZB_BDB_SIGNAL_DEVICE_REBOOT) {

@@ -35,6 +35,11 @@ logger:
 safe_mode:
   disabled: true
 
+# zigbee_batch synchronizes its persistent diagnostics explicitly. There are
+# no restored globals/switches needing a periodic flash wake in this sketch.
+preferences:
+  flash_write_interval: never
+
 # --------------------------------------------------------------------------
 # Zigbee End Device Configuration (Native IEEE 802.15.4 Radio)
 # --------------------------------------------------------------------------
@@ -51,7 +56,8 @@ zigbee:
       - lambda: |-
           id(is_joined) = true;
           id(sleep_allowed) = false;
-          id(regular_cycle_started_us) = esp_timer_get_time();
+          if (id(regular_cycle_started_us) == 0)
+            id(regular_cycle_started_us) = esp_timer_get_time();
           id(wakeup_reason) = 0;
       - script.stop: awake_safety_guard
       # Reserve an interview window only for a factory-new device.
@@ -65,7 +71,6 @@ zigbee:
             # Resume immediately with saved credentials, including rejoin.
             - script.stop: finish_join
             - lambda: 'id(sleep_allowed) = true;'
-            - script.execute: awake_safety_guard
             - if:
                 condition:
                   not:
@@ -120,7 +125,7 @@ globals:
     restore_value: no
     initial_value: '0'
 
-  # Result of the event-driven main wait: 0=regular deadline, 1=GPIO button.
+  # Result of sleep: 0=regular deadline, 1=debounced release, 2=restart.
   - id: wakeup_reason
     type: int
     restore_value: no
@@ -236,12 +241,18 @@ binary_sensor:
                   condition:
                     lambda: |-
                       return id(is_joined) && id(sleep_allowed) &&
-                             !id(measurement_cycle).is_running();
+                             (id(sleep_cycle).is_running() ||
+                              !id(measurement_cycle).is_running());
                   then:
                     - lambda: |-
                         id(button_measurement_request) = true;
                         id(wakeup_reason) = 0;
-                    - script.execute: measurement_cycle
+                    - if:
+                        condition:
+                          not:
+                            script.is_running: measurement_cycle
+                        then:
+                          - script.execute: measurement_cycle
 
 # --------------------------------------------------------------------------
 # Scripts for LED Indications and Measurement Sequence
@@ -286,6 +297,8 @@ script:
       - script.stop: finish_join
       - script.stop: awake_safety_guard
       - script.stop: measurement_cycle
+      - script.stop: sleep_cycle
+      - lambda: 'id(zb_batch).stop_sleep();'
       - script.execute: blink_pairing
       - wait_until:
           condition:
@@ -321,9 +334,9 @@ script:
       - lambda: 'id(zb_batch).prepare_restart(60010);'
       - button.press: emergency_restart
 
-  # Block only the ESPHome main task until the exact regular deadline. The
-  # Zigbee task remains runnable, and FreeRTOS automatically keeps the chip in
-  # Light Sleep between its real keepalive/rejoin work and GPIO events.
+  # Keep one sleep operation alive through raw GPIO pulses and Zigbee events.
+  # The component sleeps between actual deadlines and yields to ESPHome after
+  # each wake. Only a debounced short press requests an extra measurement.
   - id: sleep_cycle
     mode: single
     then:
@@ -336,7 +349,16 @@ script:
                 constexpr int64_t period_us = 600LL * 1000000LL;
                 const int64_t deadline_us =
                     id(regular_cycle_started_us) + period_us;
-                id(wakeup_reason) = id(zb_batch).wait_until(deadline_us);
+                id(zb_batch).start_sleep(deadline_us);
+            - wait_until:
+                condition:
+                  lambda: |-
+                    return id(button_measurement_request) ||
+                           id(zb_batch).sleep_finished();
+            - lambda: |-
+                id(zb_batch).stop_sleep();
+                id(wakeup_reason) = id(zb_batch).restart_required() ? 2 :
+                    (id(button_measurement_request) ? 1 : 0);
                 if (id(wakeup_reason) == 0)
                   id(regular_cycle_started_us) = esp_timer_get_time();
             - if:
@@ -347,8 +369,8 @@ script:
                   - button.press: emergency_restart
 
   # Single owner of regular measurements and the event-driven automatic sleep
-  # between them. A GPIO wake exits it so ESPHome can classify the short/long
-  # press; release starts one button measurement and resumes the old deadline.
+  # between them. Filtered-out pulses leave this script alive; a debounced
+  # release starts one button measurement and preserves the old deadline.
   - id: measurement_cycle
     mode: single
     then:
@@ -356,7 +378,7 @@ script:
           condition:
             lambda: |-
               return id(is_joined) && id(sleep_allowed) &&
-                     id(wakeup_reason) == 0;
+                     id(wakeup_reason) != 2;
           then:
             - if:
                 condition:
@@ -369,7 +391,7 @@ script:
                   - script.wait: sleep_cycle
                   - if:
                       condition:
-                        lambda: 'return id(wakeup_reason) != 0;'
+                        lambda: 'return id(wakeup_reason) == 2;'
                       then:
                         - script.stop: measurement_cycle
 
@@ -415,7 +437,9 @@ script:
                 id(zb_batch).add(id(humidity).state * 100.0f);
                 id(zb_batch).add(id(battery_voltage).state * 1000.0f);
                 id(zb_batch).add(id(battery_level).state);
-                id(zb_batch).add(id(uptime_sensor).state);
+                // Read integer uptime before it can lose precision in a sensor float.
+                id(zb_batch).add(static_cast<uint32_t>(
+                    esp_timer_get_time() / 1000000LL));
                 if (id(zb_last_wait_valid)) {
                   id(zb_batch).add(id(zb_last_wait_ms));
                 } else {
@@ -429,11 +453,15 @@ script:
                 condition:
                   lambda: 'return id(zb_send_queued);'
                 then:
+                  # Separate 3s packet deadlines, with automatic Light Sleep
+                  # while waiting for data and (when present) diagnostics.
+                  - switch.turn_off: status_led
+                  - lambda: 'id(zb_batch).start_tx_wait();'
                   - wait_until:
                       condition:
                         lambda: 'return id(zb_batch).is_idle();'
-                      timeout: 3s
                   - lambda: |-
+                      id(zb_batch).stop_sleep();
                       const int64_t elapsed_us =
                           esp_timer_get_time() - id(zb_wait_started_us);
                       uint32_t elapsed_ms = static_cast<uint32_t>(
@@ -441,13 +469,7 @@ script:
                       id(zb_last_wait_ms) =
                           elapsed_ms > 65535U ? 65535U : elapsed_ms;
                       id(zb_last_wait_valid) = true;
-                  - if:
-                      condition:
-                        lambda: 'return id(zb_batch).is_idle();'
-                      then:
-                        - lambda: 'id(zb_batch).finish_tx();'
-                      else:
-                        - lambda: 'id(zb_batch).handle_confirm_timeout();'
+                  - lambda: 'id(zb_batch).finish_tx();'
                 else:
                   - lambda: 'id(zb_last_wait_valid) = false;'
 

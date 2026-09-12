@@ -162,7 +162,7 @@ function decodeDiagnostic(model, msg) {
 }
 
 const definition = {
-    zigbeeModel: ['ptvo.switch'],
+    fingerprint: [{modelID: 'ptvo.switch', manufacturerName: 'esphome'}],
     model: 'ptvo.switch',
     vendor: 'ESPHome',
     description: 'ESP32-C6 Temp, Humidity & Battery Sensor',
