@@ -70,7 +70,9 @@ zigbee:
           else:
             # Resume immediately with saved credentials, including rejoin.
             - script.stop: finish_join
-            - lambda: 'id(sleep_allowed) = true;'
+            - lambda: |-
+                id(zb_batch).restore_idle_radio_mode();
+                id(sleep_allowed) = true;
             - if:
                 condition:
                   not:
@@ -258,16 +260,19 @@ binary_sensor:
 # Scripts for LED Indications and Measurement Sequence
 # --------------------------------------------------------------------------
 script:
-  # For a factory-new join, keep the radio available while the button is held
-  # and for 30 seconds after release so the coordinator can interview it.
+  # For a factory-new join, keep the radio available and fast-polling for 20
+  # seconds after release so the coordinator can interview it.
   - id: finish_join
     mode: restart
     then:
+      - lambda: 'id(zb_batch).enable_interview_radio_mode();'
       - wait_until:
           condition:
             lambda: 'return gpio_get_level(GPIO_NUM_9) == 1;'
-      - delay: 30s
-      - lambda: 'id(sleep_allowed) = true;'
+      - delay: 20s
+      - lambda: |-
+          id(zb_batch).restore_idle_radio_mode();
+          id(sleep_allowed) = true;
       - if:
           condition:
             not:
@@ -298,7 +303,9 @@ script:
       - script.stop: awake_safety_guard
       - script.stop: measurement_cycle
       - script.stop: sleep_cycle
-      - lambda: 'id(zb_batch).stop_sleep();'
+      - lambda: |-
+          id(zb_batch).restore_idle_radio_mode();
+          id(zb_batch).stop_sleep();
       - script.execute: blink_pairing
       - wait_until:
           condition:

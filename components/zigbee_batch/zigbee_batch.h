@@ -11,12 +11,14 @@
 
 #include "esp_zigbee.h"
 #include "esp_attr.h"
+#include "esp_pm.h"
 #include "ezbee/zcl/cluster/custom.h"
 
 namespace esphome {
 namespace zigbee_batch {
 
 enum class DataType : uint8_t { UINT8, UINT16, UINT32, INT8, INT16, INT32 };
+
 
 class ZigbeeBatchComponent : public Component {
  public:
@@ -90,6 +92,9 @@ class ZigbeeBatchComponent : public Component {
   bool restart_required() const {
     return this->restart_required_.load(std::memory_order_acquire);
   }
+
+  void enable_interview_radio_mode();
+  void restore_idle_radio_mode();
 
   void record_error(uint16_t code);
   void prepare_restart(uint16_t code);
@@ -204,6 +209,10 @@ class ZigbeeBatchComponent : public Component {
   std::atomic<uint16_t> transmitted_error_code_{0};
   std::atomic<uint32_t> transmitted_error_sequence_{0};
   std::atomic<bool> restart_cooldown_{false};
+  std::atomic<bool> interview_mode_active_{false};
+#if CONFIG_PM_ENABLE
+  esp_pm_lock_handle_t interview_pm_lock_{nullptr};
+#endif
 
   static ZigbeeBatchComponent *instance_;
 };

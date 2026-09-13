@@ -85,6 +85,9 @@ inline int ezb_zcl_custom_cluster_cmd_req(ezb_zcl_custom_cluster_cmd_t *c) {
 inline void ezb_nwk_set_keepalive_interval(unsigned) {}
 inline void ezb_nwk_set_rx_on_when_idle(bool) {}
 inline void ezb_nwk_set_fast_poll_interval(unsigned) {}
+inline void nwk_pim_start_poll(void) {}
+inline void nwk_pim_start_fast_poll(uint16_t) {}
+inline void nwk_pim_stop_fast_poll(void) {}
 inline int gpio_install_isr_service(int) { return 0; }
 inline int gpio_isr_handler_add(int, void (*)(void *), void *) { return 0; }
 inline int esp_sleep_enable_gpio_wakeup() { return 0; }

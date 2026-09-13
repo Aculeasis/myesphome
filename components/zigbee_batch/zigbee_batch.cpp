@@ -14,6 +14,12 @@
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 
+extern "C" {
+void nwk_pim_start_poll(void);
+void nwk_pim_start_fast_poll(uint16_t num_polls);
+void nwk_pim_stop_fast_poll(void);
+}
+
 namespace esphome {
 namespace zigbee_batch {
 
@@ -90,6 +96,10 @@ void ZigbeeBatchComponent::setup() {
   };
   if (esp_pm_configure(&pm_config) != ESP_OK)
     this->record_error(ERROR_PM_CONFIG_FAILED);
+#endif
+
+#if CONFIG_PM_ENABLE
+  esp_pm_lock_create(ESP_PM_NO_LIGHT_SLEEP, 0, "zb_interview", &this->interview_pm_lock_);
 #endif
 
   // Tickless idle lets the Zigbee task wake when the regular keepalive is due.
@@ -213,6 +223,39 @@ bool ZigbeeBatchComponent::sleep_finished() const {
 void ZigbeeBatchComponent::start_tx_wait() {
   this->start_sleep(0);
   this->waiting_for_tx_ = true;
+}
+
+void ZigbeeBatchComponent::enable_interview_radio_mode() {
+  if (this->interview_mode_active_.exchange(true, std::memory_order_acq_rel)) {
+    return;
+  }
+#if CONFIG_PM_ENABLE
+  if (this->interview_pm_lock_ != nullptr) {
+    esp_pm_lock_acquire(this->interview_pm_lock_);
+  }
+#endif
+  if (esp_zigbee_lock_acquire(pdMS_TO_TICKS(100))) {
+    ezb_nwk_set_rx_on_when_idle(true);
+    nwk_pim_start_poll();
+    nwk_pim_start_fast_poll(0xFFFF);
+    esp_zigbee_lock_release();
+  }
+}
+
+void ZigbeeBatchComponent::restore_idle_radio_mode() {
+  if (!this->interview_mode_active_.exchange(false, std::memory_order_acq_rel)) {
+    return;
+  }
+  if (esp_zigbee_lock_acquire(pdMS_TO_TICKS(100))) {
+    nwk_pim_stop_fast_poll();
+    ezb_nwk_set_rx_on_when_idle(false);
+    esp_zigbee_lock_release();
+  }
+#if CONFIG_PM_ENABLE
+  if (this->interview_pm_lock_ != nullptr) {
+    esp_pm_lock_release(this->interview_pm_lock_);
+  }
+#endif
 }
 
 void ZigbeeBatchComponent::sleep_step_() {

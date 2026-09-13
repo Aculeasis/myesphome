@@ -1,8 +1,7 @@
 Repository: https://github.com/Aculeasis/myesphome
 
+ESPHome is installed in a virtual environment (`.venv`).
 ESPHome components are located in `components/`.
-
-Do not run ESPHome for validation.
 
 `sketches/esp32_c6_th/esp32-c6-zigbee-th.yaml` runs on battery power.
 It must spend as much time as possible in Light Sleep to maximize battery life.
